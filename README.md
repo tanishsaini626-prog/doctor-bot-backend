@@ -28,6 +28,7 @@ was named `doctor.env`, it still works.
 | POST | `/webhook/doctor-bot` | Twilio sig* | every speech turn (TwiML reply) |
 | POST | `/webhook/status` | Twilio sig* | Twilio status callback → saves abandoned calls |
 | POST | `/api/auth/login` | – | `{ email, password }` → `{ token, user }` |
+| GET | `/api/auth/bootstrap` | – | first-run hint: names the admin while the shipped default password is still in use |
 | POST | `/api/auth/register` | admin token (after the 1st user) | create clinic_owner / receptionist |
 | GET | `/api/me` | JWT | current user |
 | GET | `/api/appointments` | JWT | list (`?status=&q=&date=&limit=`) |
@@ -50,9 +51,18 @@ email:    ADMIN_EMAIL    (default admin@medibot.local)
 password: ADMIN_PASSWORD (default medibot-admin)
 ```
 
-Change both in `.env` and restart. After that, new users can only be created by
-an admin via `POST /api/auth/register`, with roles `clinic_owner` or
-`receptionist`. Tokens last 12 hours; the dashboard stores one and sends it as
+Put **your own** email in `ADMIN_EMAIL` before the first boot and that becomes
+the admin account. Already started once? Delete the `users` collection (or drop
+the in-memory data by restarting) and it is recreated with the new email.
+
+**Changing the password later:** set `ADMIN_PASSWORD` in `.env` and restart. If
+the account still has the shipped default, the server upgrades the hash on boot
+(log line: "Admin password updated from ADMIN_PASSWORD"). Once the password is
+your own, the `/api/auth/bootstrap` first-run hint disappears from the login page.
+
+After the first user exists, new users can only be created by an admin via
+`POST /api/auth/register`, with roles `clinic_owner` or `receptionist`. Tokens
+last 12 hours; the dashboard stores one and sends it as
 `Authorization: Bearer <token>`.
 
 ## Data model (Phase B)

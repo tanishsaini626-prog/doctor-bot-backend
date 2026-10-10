@@ -16,6 +16,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
 const TOKEN_HOURS = 12;
+const DEFAULT_ADMIN_PASSWORD = 'medibot-admin';   // shipped dev default, see .env.example
 
 function createAuth(store) {
   const router = express.Router();
@@ -34,6 +35,29 @@ function createAuth(store) {
       role: user.role, clinic: user.clinic || null,
     };
   }
+
+  // ---- first-run hint -----------------------------------------------------
+  // Public, read-only. Tells the login page which account exists and whether it
+  // still uses the shipped default password, so a brand-new install is not a
+  // dead end. Once you set your own ADMIN_PASSWORD this reports first_run:false.
+  router.get('/auth/bootstrap', async (req, res) => {
+    const fallback = { first_run: false, admin_email: null, min_password_length: 8 };
+    try {
+      const email = (process.env.ADMIN_EMAIL || 'admin@medibot.local').toLowerCase();
+      const configuredPassword = process.env.ADMIN_PASSWORD || DEFAULT_ADMIN_PASSWORD;
+      const usingShippedDefault = configuredPassword === DEFAULT_ADMIN_PASSWORD;
+      const admin = usingShippedDefault ? await store.findUserByEmail(email) : null;
+      const firstRun = !!(admin && admin.role === 'admin' &&
+        await bcrypt.compare(DEFAULT_ADMIN_PASSWORD, admin.password_hash));
+      res.json({
+        first_run: firstRun,
+        admin_email: firstRun ? admin.email : null,
+        min_password_length: 8,
+      });
+    } catch (err) {
+      res.json(fallback);
+    }
+  });
 
   // ---- register ----------------------------------------------------------
   router.post('/auth/register', optionalAuth, async (req, res) => {
@@ -132,17 +156,34 @@ function requireAuth(req, res, next) {
   }
 }
 
-/** Creates the first admin automatically on boot (idempotent). */
+/**
+ * Creates the first admin automatically on boot (idempotent).
+ * Also upgrades the password when you set ADMIN_PASSWORD after the first run.
+ */
 async function ensureSeedAdmin(store) {
   if (!process.env.JWT_SECRET) {
     throw new Error('JWT_SECRET is not set - add it to .env before starting the server.');
   }
-  if ((await store.countUsers()) > 0) return null;
   const email = (process.env.ADMIN_EMAIL || 'admin@medibot.local').toLowerCase();
-  const password = process.env.ADMIN_PASSWORD || 'medibot-admin';
-  const password_hash = await bcrypt.hash(password, 10);
-  const user = await store.createUser({ email, password_hash, name: 'Clinic Admin', role: 'admin' });
-  return user;
+  const password = process.env.ADMIN_PASSWORD || DEFAULT_ADMIN_PASSWORD;
+
+  const existing = await store.findUserByEmail(email);
+  if (!existing) {
+    // never hijack an install that already has users
+    if ((await store.countUsers()) > 0) return null;
+    const password_hash = await bcrypt.hash(password, 10);
+    return store.createUser({ email, password_hash, name: 'Clinic Admin', role: 'admin' });
+  }
+
+  // The account exists. If it still carries the shipped default and you have
+  // now configured your own ADMIN_PASSWORD, apply it (so the README promise
+  // "change ADMIN_PASSWORD and restart" really works).
+  const stillDefault = await bcrypt.compare(DEFAULT_ADMIN_PASSWORD, existing.password_hash);
+  if (stillDefault && password !== DEFAULT_ADMIN_PASSWORD) {
+    await store.updateUserPassword(existing._id, await bcrypt.hash(password, 10));
+    return Object.assign({}, existing, { password_updated: true });
+  }
+  return null;
 }
 
 module.exports = { createAuth, requireAuth, optionalAuth, ensureSeedAdmin };

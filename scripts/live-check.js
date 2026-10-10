@@ -201,6 +201,12 @@ const spoken = (xml) => {
   console.log('\n=== 14. Login works and returns a working token ===');
   const adminEmail = process.env.ADMIN_EMAIL || 'admin@medibot.local';
   const adminPass = process.env.ADMIN_PASSWORD || 'medibot-admin';
+
+  const bootstrap = await (await fetch(BASE + '/api/auth/bootstrap')).json();
+  check('bootstrap tells a new install about the first run', bootstrap.first_run === true, JSON.stringify(bootstrap));
+  check('bootstrap names the seeded admin so the login page can help', bootstrap.admin_email === adminEmail, bootstrap.admin_email);
+  check('bootstrap never leaks a password hash', !JSON.stringify(bootstrap).toLowerCase().includes('password_hash'));
+
   const badLogin = await fetch(BASE + '/api/auth/login', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email: adminEmail, password: 'wrong-password' }),

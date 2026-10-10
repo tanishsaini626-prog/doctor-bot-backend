@@ -42,6 +42,13 @@ function createMemoryStore(options) {
       return clone(doc);
     },
 
+    async updateUserPassword(userId, password_hash) {
+      const user = users.find(u => u._id === userId);
+      if (!user) return null;
+      user.password_hash = password_hash;
+      return clone(user);
+    },
+
     // ---------------------------------------------------------- call logs
     async logCallTurn(callSid, turn) {
       if (!callSid) return null;

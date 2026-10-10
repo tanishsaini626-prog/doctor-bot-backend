@@ -50,7 +50,7 @@ let activeStore = createMemoryStore();
 let storeKind = 'memory';
 const DELEGATED = ['getSession', 'saveSession', 'clearSession', 'findDuplicate', 'countBooked',
   'createAppointment', 'listAppointments', 'getAppointment', 'updateAppointmentStatus', 'stats',
-  'countUsers', 'findUserByEmail', 'createUser', 'logCallTurn', 'listCallLogs'];
+  'countUsers', 'findUserByEmail', 'createUser', 'updateUserPassword', 'logCallTurn', 'listCallLogs'];
 const store = {};
 for (const method of DELEGATED) {
   store[method] = (...args) => activeStore[method](...args);
@@ -95,7 +95,9 @@ const { router: authRouter } = createAuth(store);
 initStore().then(async () => {
   try {
     const seeded = await ensureSeedAdmin(store);
-    if (seeded) {
+    if (seeded && seeded.password_updated) {
+      console.log('🔑 Admin password updated from ADMIN_PASSWORD in .env for', seeded.email);
+    } else if (seeded) {
       console.log('👤 Created the first admin account:', seeded.email);
       if (!process.env.ADMIN_PASSWORD) {
         console.log('   Default password: medibot-admin  ->  change it by setting ADMIN_PASSWORD in .env and restarting.');

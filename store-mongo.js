@@ -59,6 +59,10 @@ function createMongoStore() {
       return (await User.create(data)).toObject();
     },
 
+    async updateUserPassword(userId, password_hash) {
+      return User.findByIdAndUpdate(userId, { $set: { password_hash } }, { new: true }).lean();
+    },
+
     // ---------------------------------------------------------- call logs
     async logCallTurn(callSid, turn) {
       if (!callSid) return null;
