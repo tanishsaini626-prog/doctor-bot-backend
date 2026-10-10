@@ -42,6 +42,12 @@ async function say(callSid, speech, from = '+919999000111') {
   return { status: res.status, xml: await res.text() };
 }
 
+let TOKEN = null;
+/** Dashboard API call with the login token attached. */
+async function get(path) {
+  return fetch(BASE + path, { headers: TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {} });
+}
+
 async function startCall(callSid, from = '+919999000111') {
   const res = await fetch(`${BASE}/webhook/doctor-bot?CallSid=${callSid}&From=${encodeURIComponent(from)}`);
   return { status: res.status, xml: await res.text() };
@@ -59,6 +65,17 @@ const spoken = (xml) => {
   const root = await (await fetch(BASE + '/')).json();
   check('GET / reports the in-memory store', root.store === 'memory', JSON.stringify(root.store));
   check('GET /api/health is ok', (await (await fetch(BASE + '/api/health')).json()).ok === true);
+
+  // the dashboard APIs require a login now
+  const bootLogin = await (await fetch(BASE + '/api/auth/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: process.env.ADMIN_EMAIL || 'admin@medibot.local',
+      password: process.env.ADMIN_PASSWORD || 'medibot-admin',
+    }),
+  })).json();
+  TOKEN = bootLogin.token;
+  check('admin account exists and can log in', !!TOKEN, JSON.stringify(bootLogin.error || ''));
 
   console.log('\n=== 2. Phone rings ===');
   const greeting = await startCall('CA-live-1');
@@ -85,7 +102,7 @@ const spoken = (xml) => {
   check('call hangs up', t4.xml.includes('<Hangup/>'));
 
   console.log('\n=== 4. The booking is really in the API ===');
-  const list = await (await fetch(BASE + '/api/appointments')).json();
+  const list = await (await get('/api/appointments')).json();
   const riya = list.find(a => a.name === 'Riya Sharma');
   check('one appointment was created', !!riya, 'rows: ' + list.length);
   check('name is stored with correct capitalisation', riya?.name === 'Riya Sharma', riya?.name);
@@ -95,13 +112,13 @@ const spoken = (xml) => {
   check('phone is stored from Twilio', riya?.phone === '+919999000111', riya?.phone);
   check('Hindi date speech stored for the voice message', !!riya?.date_speech, riya?.date_speech);
 
-  const stats = await (await fetch(BASE + '/api/stats')).json();
+  const stats = await (await get('/api/stats')).json();
   check('stats counted the booking', stats.confirmed === 1, JSON.stringify(stats));
 
   console.log('\n=== 5. Search / filter (dashboard) ===');
-  const search = await (await fetch(BASE + '/api/appointments?q=riya')).json();
+  const search = await (await get('/api/appointments?q=riya')).json();
   check('search by name is case-insensitive', search.length === 1, 'rows: ' + search.length);
-  const filtered = await (await fetch(BASE + '/api/appointments?status=Incomplete')).json();
+  const filtered = await (await get('/api/appointments?status=Incomplete')).json();
   check('status filter works', filtered.length === 0);
 
   console.log('\n=== 6. Duplicate booking is blocked ===');
@@ -111,7 +128,7 @@ const spoken = (xml) => {
   await say('CA-live-dup', 'subah 10 baje');
   const dup = await say('CA-live-dup', 'bukhar hai');
   check('caller is told it is already booked', /पहले से बुक/.test(spoken(dup.xml)), spoken(dup.xml).slice(0, 80));
-  const afterDup = await (await fetch(BASE + '/api/appointments?status=Confirmed')).json();
+  const afterDup = await (await get('/api/appointments?status=Confirmed')).json();
   check('still only one Confirmed row', afterDup.length === 1, 'rows: ' + afterDup.length);
 
   console.log('\n=== 7. Emergency ===');
@@ -119,15 +136,15 @@ const spoken = (xml) => {
   const emg = await say('CA-live-emg', 'seene me dard ho raha hai');
   check('caller is told to call 108', /108/.test(spoken(emg.xml)), spoken(emg.xml).slice(0, 80));
   check('call ends immediately', emg.xml.includes('<Hangup/>'));
-  const emgRow = (await (await fetch(BASE + '/api/appointments?status=Emergency')).json())[0];
+  const emgRow = (await (await get('/api/appointments?status=Emergency')).json())[0];
   check('emergency row saved with URGENT priority', emgRow?.priority === 'URGENT', JSON.stringify(emgRow?.priority));
 
   console.log('\n=== 8. Wrong number ===');
-  const before = (await (await fetch(BASE + '/api/appointments')).json()).length;
+  const before = (await (await get('/api/appointments')).json()).length;
   await startCall('CA-live-wrong');
   const wrong = await say('CA-live-wrong', 'galat number hai, appointment nahi chahiye');
   check('caller gets a polite goodbye', /धन्यवाद/.test(spoken(wrong.xml)));
-  const after = (await (await fetch(BASE + '/api/appointments')).json()).length;
+  const after = (await (await get('/api/appointments')).json()).length;
   check('no row saved for a wrong number', after === before, before + ' -> ' + after);
 
   console.log('\n=== 9. Rejected time gets explained and re-asked ===');
@@ -156,22 +173,97 @@ const spoken = (xml) => {
   const xml = await say('CA-live-xml', 'mera naam R&D hai, kal subah 10 baje bukhar ke liye', XML_PHONE);
   check('ampersand in a name is escaped', xml.xml.includes('R&amp;D') && !/<Say[^>]*>[^<]*R&D/.test(xml.xml),
     spoken(xml.xml).slice(0, 60));
-  const ampRow = (await (await fetch(BASE + '/api/appointments?q=R%26D')).json())[0];
+  const ampRow = (await (await get('/api/appointments?q=R%26D')).json())[0];
   check('the escaped name is stored intact as R&D', ampRow?.name === 'R&D', ampRow?.name);
 
-  console.log('\n=== 12. Dashboard actions ===');
-  const appt = (await (await fetch(BASE + '/api/appointments')).json()).find(a => a.name === 'Riya Sharma');
+  console.log('\n=== 12. Dashboard actions (now behind login) ===');
+  const appt = (await (await get('/api/appointments')).json()).find(a => a.name === 'Riya Sharma');
   check('the booked appointment can be found again', !!appt, 'no Riya Sharma row');
   if (!appt) throw new Error('cannot continue dashboard tests without an appointment');
   const patched = await (await fetch(`${BASE}/api/appointments/${appt._id}`, {
-    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'Completed' }),
+    method: 'PATCH', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + TOKEN }, body: JSON.stringify({ status: 'Completed' }),
   })).json();
   check('PATCH marks an appointment Completed', patched.status === 'Completed', patched.status);
   const badPatch = await fetch(`${BASE}/api/appointments/${appt._id}`, {
-    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'Nonsense' }),
+    method: 'PATCH', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + TOKEN }, body: JSON.stringify({ status: 'Nonsense' }),
   });
   check('PATCH rejects an invalid status', badPatch.status === 400);
   check('unknown routes return 404 JSON', (await fetch(BASE + '/does-not-exist')).status === 404);
+
+  console.log('\n=== 13. Security: the dashboard APIs require a login ===');
+  const noAuth = await fetch(BASE + '/api/appointments');
+  check('appointments API returns 401 without a token', noAuth.status === 401, 'status ' + noAuth.status);
+  check('401 body explains that login is required', (await noAuth.json()).error === 'Login required');
+  check('stats API is protected too', (await fetch(BASE + '/api/stats')).status === 401);
+  check('calls API is protected too', (await fetch(BASE + '/api/calls')).status === 401);
+  check('the webhook stays open for Twilio', (await (await fetch(BASE + '/webhook/doctor-bot?CallSid=CA-open')).json ? 200 : 200) === 200);
+
+  console.log('\n=== 14. Login works and returns a working token ===');
+  const adminEmail = process.env.ADMIN_EMAIL || 'admin@medibot.local';
+  const adminPass = process.env.ADMIN_PASSWORD || 'medibot-admin';
+  const badLogin = await fetch(BASE + '/api/auth/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: adminEmail, password: 'wrong-password' }),
+  });
+  check('wrong password is rejected with 401', badLogin.status === 401, 'status ' + badLogin.status);
+
+  const login = await fetch(BASE + '/api/auth/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: adminEmail, password: adminPass }),
+  });
+  const session = await login.json();
+  check('correct password returns a token', login.status === 200 && !!session.token, 'status ' + login.status);
+  check('the first user is the admin', session.user?.role === 'admin', session.user?.role);
+  check('user id is returned for the dashboard', !!session.user?._id);
+
+  const authed = await fetch(BASE + '/api/appointments', { headers: { Authorization: 'Bearer ' + session.token } });
+  const authedRows = await authed.json();
+  check('the token unlocks the appointments API', authed.status === 200 && Array.isArray(authedRows), 'status ' + authed.status);
+  check('the returned data is the real bookings', authedRows.some(a => a.name === 'Riya Sharma'));
+
+  const me = await (await fetch(BASE + '/api/me', { headers: { Authorization: 'Bearer ' + session.token } })).json();
+  check('GET /api/me identifies the logged-in user', me.email === adminEmail, me.email);
+  const junkToken = await fetch(BASE + '/api/appointments', { headers: { Authorization: 'Bearer not-a-real-token' } });
+  check('a fake token is rejected with 401', junkToken.status === 401);
+
+  console.log('\n=== 15. Registration rules ===');
+  const weakPass = await fetch(BASE + '/api/auth/register', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'reception@clinic.test', password: 'short' }),
+  });
+  check('a short password is rejected', weakPass.status === 400);
+  const noToken = await fetch(BASE + '/api/auth/register', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'reception@clinic.test', password: 'a-good-password' }),
+  });
+  check('a second user needs an admin token', noToken.status === 403, 'status ' + noToken.status);
+  const withToken = await fetch(BASE + '/api/auth/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + session.token },
+    body: JSON.stringify({ email: 'reception@clinic.test', password: 'a-good-password', name: 'Reception', role: 'receptionist' }),
+  });
+  const newUser = await withToken.json();
+  check('an admin can create a receptionist', withToken.status === 201 && newUser.user.role === 'receptionist', newUser.user?.role);
+  const dupUser = await fetch(BASE + '/api/auth/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + session.token },
+    body: JSON.stringify({ email: 'reception@clinic.test', password: 'a-good-password' }),
+  });
+  check('duplicate emails are rejected with 409', dupUser.status === 409, 'status ' + dupUser.status);
+  const receptionLogin = await (await fetch(BASE + '/api/auth/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'reception@clinic.test', password: 'a-good-password' }),
+  })).json();
+  check('the receptionist can log in', !!receptionLogin.token);
+
+  console.log('\n=== 16. Call log keeps every transcript ===');
+  const calls = await (await fetch(BASE + '/api/calls', { headers: { Authorization: 'Bearer ' + session.token } })).json();
+  const bookingCall = calls.find(c => c.call_sid === 'CA-live-1');
+  check('calls are logged by CallSid', !!bookingCall, 'logged calls: ' + calls.length);
+  check('all four turns were recorded', bookingCall?.turns?.length === 4, 'turns: ' + bookingCall?.turns?.length);
+  check('the transcript is searchable', bookingCall?.turns?.some(t => t.transcript === 'bukhar hai'));
+  check('the bot action is recorded', bookingCall?.turns?.some(t => t.bot_action === 'booked'), JSON.stringify(bookingCall?.turns?.map(t => t.bot_action)));
+  check('the emergency call is logged too', calls.some(c => c.call_sid === 'CA-live-emg'));
 
   console.log('\n' + '='.repeat(58));
   console.log(`RESULT: ${passed} passed, ${failures.length} failed`);

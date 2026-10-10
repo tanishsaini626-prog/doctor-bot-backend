@@ -4,6 +4,7 @@
  * ========================================================================== */
 
 const mongoose = require('mongoose');
+const { Clinic, Doctor, User, CallLog } = require('./models');
 
 const AppointmentSchema = new mongoose.Schema({
   name: { type: String, default: 'Unknown' },
@@ -45,6 +46,47 @@ const CallSession = mongoose.model('CallSession', SessionSchema);
 
 function createMongoStore() {
   return {
+    // ------------------------------------------------------------- users
+    async countUsers() {
+      return User.countDocuments({});
+    },
+
+    async findUserByEmail(email) {
+      return User.findOne({ email: String(email).toLowerCase() }).lean();
+    },
+
+    async createUser(data) {
+      return (await User.create(data)).toObject();
+    },
+
+    // ---------------------------------------------------------- call logs
+    async logCallTurn(callSid, turn) {
+      if (!callSid) return null;
+      return CallLog.findOneAndUpdate(
+        { call_sid: callSid },
+        {
+          $set: {
+            ...(turn.phone !== undefined ? { phone: turn.phone } : {}),
+            ...(turn.status ? { status: turn.status } : {}),
+          },
+          $push: {
+            ...(turn.transcript !== undefined || turn.bot_action !== undefined ? {
+              turns: {
+                at: new Date(),
+                transcript: turn.transcript || '',
+                bot_action: turn.bot_action || '',
+              },
+            } : {}),
+          },
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      ).lean();
+    },
+
+    async listCallLogs({ limit = 100 } = {}) {
+      return CallLog.find({}).sort({ createdAt: -1 }).limit(Math.min(Number(limit) || 100, 500)).lean();
+    },
+
     async getSession(callSid) {
       if (!callSid) return null;
       return CallSession.findOne({ call_sid: callSid }).lean();
@@ -109,4 +151,4 @@ function createMongoStore() {
   };
 }
 
-module.exports = { createMongoStore, Appointment, CallSession };
+module.exports = { createMongoStore, Appointment, CallSession, Clinic, Doctor, User, CallLog };

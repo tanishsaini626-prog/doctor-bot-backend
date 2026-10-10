@@ -29,6 +29,8 @@ const BotEngine = require('./bot-engine');
 const { createConversation } = require('./conversation');
 const { createMongoStore } = require('./store-mongo');
 const { createMemoryStore } = require('./store-memory');
+const { createAuth, requireAuth, ensureSeedAdmin } = require('./auth');
+const { requireTwilioSignature } = require('./twilio-signature');
 
 const PORT = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI || '';
@@ -47,7 +49,8 @@ mongoose.set('bufferTimeoutMS', 3000);           // fail fast, never freeze a li
 let activeStore = createMemoryStore();
 let storeKind = 'memory';
 const DELEGATED = ['getSession', 'saveSession', 'clearSession', 'findDuplicate', 'countBooked',
-  'createAppointment', 'listAppointments', 'getAppointment', 'updateAppointmentStatus', 'stats'];
+  'createAppointment', 'listAppointments', 'getAppointment', 'updateAppointmentStatus', 'stats',
+  'countUsers', 'findUserByEmail', 'createUser', 'logCallTurn', 'listCallLogs'];
 const store = {};
 for (const method of DELEGATED) {
   store[method] = (...args) => activeStore[method](...args);
@@ -82,9 +85,26 @@ async function initStore() {
     console.warn('    Fix MONGODB_URI in .env (create a free M0 cluster on cloud.mongodb.com) and restart.');
   }
 }
-initStore();
 
 const bot = createConversation({ store, maxPerSlot: MAX_PER_SLOT });
+const { router: authRouter } = createAuth(store);
+
+// ---- 2b. admin account ---------------------------------------------------
+// JWT_SECRET is required in .env (generate one, never commit it). The first
+// admin is created automatically so a fresh install can log in immediately.
+initStore().then(async () => {
+  try {
+    const seeded = await ensureSeedAdmin(store);
+    if (seeded) {
+      console.log('👤 Created the first admin account:', seeded.email);
+      if (!process.env.ADMIN_PASSWORD) {
+        console.log('   Default password: medibot-admin  ->  change it by setting ADMIN_PASSWORD in .env and restarting.');
+      }
+    }
+  } catch (err) {
+    console.error('⚠️  Could not prepare the admin account:', err.message);
+  }
+});
 
 // ---- 3. WhatsApp notification to the clinic (optional) -------------------
 let twilioClient = null;
@@ -123,14 +143,21 @@ function twiml(res, xml, code = 200) {
   res.status(code).set('Content-Type', 'application/xml').send(xml);
 }
 
+// ---- 4b. Twilio signature check (used on all three webhook routes) -------
+const twilioSignature = requireTwilioSignature();
+
 // ---- 5. routes ----------------------------------------------------------
+// Login / register (public)
+app.use('/api', authRouter);
+
 app.get('/', (req, res) => {
   res.json({
     service: 'MediBot backend',
     status: 'ok',
     store: storeKind,
     database: storeKind === 'memory' ? 'in-memory (not persistent)' : (mongoose.connection.readyState === 1 ? 'connected' : 'connecting'),
-    endpoints: ['/webhook/doctor-bot', '/webhook/status', '/api/appointments', '/api/stats'],
+    signature_validation: String(process.env.TWILIO_VALIDATE_SIGNATURE || '').toLowerCase() === 'true',
+    endpoints: ['/webhook/doctor-bot', '/webhook/status', '/api/auth/login', '/api/appointments', '/api/calls', '/api/stats'],
   });
 });
 
@@ -144,7 +171,7 @@ app.get('/api/health', (req, res) => {
 });
 
 // Phone rings -> fresh session -> greeting + first question.
-app.get('/webhook/doctor-bot', async (req, res) => {
+app.get('/webhook/doctor-bot', twilioSignature, async (req, res) => {
   const callSid = (req.query.CallSid) || (req.body && req.body.CallSid) || '';
   try {
     if (storeReady()) await store.clearSession(callSid);   // re-calling starts a clean conversation
@@ -156,7 +183,7 @@ app.get('/webhook/doctor-bot', async (req, res) => {
 });
 
 // Every speech turn.
-app.post('/webhook/doctor-bot', async (req, res) => {
+app.post('/webhook/doctor-bot', twilioSignature, async (req, res) => {
   const body = req.body || {};
   const callSid = body.CallSid || '';
   const from = body.From || '';
@@ -171,6 +198,18 @@ app.post('/webhook/doctor-bot', async (req, res) => {
       actionUrl: actionUrl(req),
       notifyClinic,
     });
+    // keep a searchable call log (transcript + what the bot did)
+    try {
+      await store.logCallTurn(callSid, {
+        phone: from,
+        transcript,
+        bot_action: result.status === 'Confirmed' ? 'booked'
+          : result.asked_field ? 'asked:' + result.asked_field
+          : String(result.status || 'ended').toLowerCase(),
+      });
+    } catch (logErr) {
+      console.error('Call log failed:', logErr.message);   // never break the call
+    }
     twiml(res, result.twiml);
   } catch (err) {
     // A crashed webhook would drop the call - always answer with valid TwiML.
@@ -182,10 +221,18 @@ app.post('/webhook/doctor-bot', async (req, res) => {
 });
 
 // Twilio status callback -> saves calls where the caller hung up mid-way.
-app.post('/webhook/status', async (req, res) => {
+app.post('/webhook/status', twilioSignature, async (req, res) => {
   const body = req.body || {};
   try {
     const result = await bot.handleStatus({ callSid: body.CallSid, callStatus: body.CallStatus });
+    try {
+      await store.logCallTurn(body.CallSid, {
+        status: String(body.CallStatus || '').toLowerCase() === 'completed' ? 'completed' : 'ended',
+        duration_seconds: parseInt(body.CallDuration || '0', 10) || 0,
+      });
+    } catch (logErr) {
+      console.error('Call log status failed:', logErr.message);
+    }
     console.log('📴 Call', body.CallSid, body.CallStatus, '->', result.status || 'no change');
     res.json(result);
   } catch (err) {
@@ -194,8 +241,10 @@ app.post('/webhook/status', async (req, res) => {
   }
 });
 
-// Dashboard API
-app.get('/api/appointments', async (req, res) => {
+// Dashboard APIs are private (Bearer JWT from /api/auth/login)
+const private_api = requireAuth;
+
+app.get('/api/appointments', private_api, async (req, res) => {
   try {
     const list = await store.listAppointments({
       status: req.query.status,
@@ -210,7 +259,7 @@ app.get('/api/appointments', async (req, res) => {
   }
 });
 
-app.get('/api/appointments/:id', async (req, res) => {
+app.get('/api/appointments/:id', private_api, async (req, res) => {
   try {
     const one = await store.getAppointment(req.params.id);
     if (!one) return res.status(404).json({ error: 'Not found' });
@@ -220,7 +269,7 @@ app.get('/api/appointments/:id', async (req, res) => {
   }
 });
 
-app.patch('/api/appointments/:id', async (req, res) => {
+app.patch('/api/appointments/:id', private_api, async (req, res) => {
   const allowed = ['Confirmed', 'Completed', 'Cancelled', 'Incomplete'];
   const status = req.body && req.body.status;
   if (!allowed.includes(status)) {
@@ -235,10 +284,22 @@ app.patch('/api/appointments/:id', async (req, res) => {
   }
 });
 
-app.get('/api/stats', async (req, res) => {
+// Call log for the dashboard (transcripts + what the bot did)
+app.get('/api/calls', private_api, async (req, res) => {
+  try {
+    const list = await store.listCallLogs({ limit: req.query.limit });
+    res.json(list);
+  } catch (err) {
+    console.error('Call log list failed:', err.message);
+    res.status(500).json({ error: 'Could not load call logs' });
+  }
+});
+
+app.get('/api/stats', private_api, async (req, res) => {
   try {
     res.json(await store.stats());
   } catch (err) {
+    console.error('Stats failed:', err.message);
     res.status(500).json({ error: 'Could not load stats' });
   }
 });
@@ -252,6 +313,7 @@ if (require.main === module) {
     console.log('MediBot backend running on port ' + PORT);
     console.log('Storage:', storeKind === 'mongo' ? 'MongoDB' : 'in-memory');
     console.log('Twilio webhook: POST /webhook/doctor-bot');
+    console.log('Signature validation:', String(process.env.TWILIO_VALIDATE_SIGNATURE || '').toLowerCase() === 'true' ? 'ON' : 'off (set TWILIO_VALIDATE_SIGNATURE=true before going live)');
     console.log('Slot cap:', MAX_PER_SLOT > 0 ? MAX_PER_SLOT + ' per slot' : 'unlimited');
     console.log('===================================');
   });

@@ -10,6 +10,8 @@
 function createMemoryStore(options) {
   const appointments = [];
   const sessions = new Map();
+  const users = [];
+  const callLogs = new Map();
   let nextId = 1;
   const id = () => 'mem_' + (nextId++);
 
@@ -18,6 +20,54 @@ function createMemoryStore(options) {
   return {
     kind: 'memory',
     appointments,            // exposed for tests
+    users,                   // exposed for tests
+
+    // ------------------------------------------------------------- users
+    async countUsers() { return users.length; },
+
+    async findUserByEmail(email) {
+      return clone(users.find(u => u.email === String(email).toLowerCase())) || null;
+    },
+
+    async createUser(data) {
+      const doc = Object.assign({
+        _id: id(),
+        clinic: null,
+        name: '',
+        role: 'receptionist',
+        active: true,
+        createdAt: new Date().toISOString(),
+      }, data);
+      users.push(doc);
+      return clone(doc);
+    },
+
+    // ---------------------------------------------------------- call logs
+    async logCallTurn(callSid, turn) {
+      if (!callSid) return null;
+      let log = callLogs.get(callSid);
+      if (!log) {
+        log = { _id: id(), call_sid: callSid, clinic: null, phone: '', status: 'in-progress', turns: [], createdAt: new Date().toISOString() };
+        callLogs.set(callSid, log);
+      }
+      if (turn.phone !== undefined) log.phone = turn.phone;
+      if (turn.status) log.status = turn.status;
+      if (turn.transcript !== undefined || turn.bot_action !== undefined) {
+        log.turns.push({
+          at: new Date().toISOString(),
+          transcript: turn.transcript || '',
+          bot_action: turn.bot_action || '',
+        });
+      }
+      return clone(log);
+    },
+
+    async listCallLogs({ limit = 100 } = {}) {
+      return [...callLogs.values()]
+        .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+        .slice(0, Math.min(Number(limit) || 100, 500))
+        .map(clone);
+    },
 
     async getSession(callSid) {
       if (!callSid) return null;

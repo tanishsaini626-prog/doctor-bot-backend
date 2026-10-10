@@ -8,9 +8,10 @@ Node instead of n8n.
 
 ```bash
 npm install
-cp .env.example .env        # then fill in MONGODB_URI (and Twilio, optional)
+cp .env.example .env        # then fill in MONGODB_URI and JWT_SECRET
 npm start                   # http://localhost:5000
-npm test                    # 42 tests, no database needed
+npm test                    # 50 unit tests, no database needed
+npm run test:live           # 64 checks against a real running server
 ```
 
 `server.js` loads `.env`, `doctor.env` and `.env.local`, so the old
@@ -19,17 +20,49 @@ was named `doctor.env`, it still works.
 
 ## Endpoints
 
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `/` | health + which endpoints exist |
-| GET | `/api/health` | uptime + database state |
-| GET | `/webhook/doctor-bot` | Twilio rings → Hindi greeting + first question |
-| POST | `/webhook/doctor-bot` | every speech turn (TwiML reply) |
-| POST | `/webhook/status` | Twilio status callback → saves abandoned calls |
-| GET | `/api/appointments` | list (`?status=&q=&date=&limit=`) |
-| GET | `/api/appointments/:id` | one appointment |
-| PATCH | `/api/appointments/:id` | `{ "status": "Completed" }` or `Cancelled` |
-| GET | `/api/stats` | dashboard counters |
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| GET | `/` | – | health + which endpoints exist |
+| GET | `/api/health` | – | uptime + database state |
+| GET | `/webhook/doctor-bot` | Twilio sig* | Twilio rings → Hindi greeting + first question |
+| POST | `/webhook/doctor-bot` | Twilio sig* | every speech turn (TwiML reply) |
+| POST | `/webhook/status` | Twilio sig* | Twilio status callback → saves abandoned calls |
+| POST | `/api/auth/login` | – | `{ email, password }` → `{ token, user }` |
+| POST | `/api/auth/register` | admin token (after the 1st user) | create clinic_owner / receptionist |
+| GET | `/api/me` | JWT | current user |
+| GET | `/api/appointments` | JWT | list (`?status=&q=&date=&limit=`) |
+| GET | `/api/appointments/:id` | JWT | one appointment |
+| PATCH | `/api/appointments/:id` | JWT | `{ "status": "Completed" }` or `Cancelled` |
+| GET | `/api/calls` | JWT | call log with full transcripts (`?limit=`) |
+| GET | `/api/stats` | JWT | dashboard counters |
+
+\* Twilio signature validation runs when `TWILIO_VALIDATE_SIGNATURE=true`
+(recommended once you are on a public URL). Leave it `false` for local curl/ngrok
+testing.
+
+## Login
+
+Set `JWT_SECRET` in `.env` (required). On the first boot the server creates one
+admin account so you can log in immediately:
+
+```
+email:    ADMIN_EMAIL    (default admin@medibot.local)
+password: ADMIN_PASSWORD (default medibot-admin)
+```
+
+Change both in `.env` and restart. After that, new users can only be created by
+an admin via `POST /api/auth/register`, with roles `clinic_owner` or
+`receptionist`. Tokens last 12 hours; the dashboard stores one and sends it as
+`Authorization: Bearer <token>`.
+
+## Data model (Phase B)
+
+- `appointments` – the bookings (voice-flow internal, created by conversation.js)
+- `callsessions` – in-progress call state, keyed by `CallSid`
+- `clinics` – one per customer (name, greeting, WhatsApp target, languages)
+- `doctors` – belongs to a clinic (specialty, slot length, working hours, holidays)
+- `users` – dashboard logins (admin / clinic_owner / receptionist, bcrypt hashes)
+- `calllogs` – one per phone call: phone, status, turns[] of { transcript, bot_action, at }
 
 Point your Twilio number's voice webhook at
 `https://<your-domain>/webhook/doctor-bot`. Set the number's **status callback**
