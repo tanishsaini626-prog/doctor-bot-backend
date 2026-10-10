@@ -1,2 +1,23 @@
-node_modules
+# Secrets - never commit
+.env
 *.env
+.env.*
+!.env.example
+doctor.env
+mongoatlas.txt
+n8n-doctor-bot-*.json
+*service-account*.json
+*service_account*.json
+*.pem
+*.key
+📋 PROJECT CONTEXT DOCTOR BOT.txt
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,19 +1,28 @@
 {
   "name": "doctor-bot-backend",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "description": "MediBot backend - Twilio voice webhook + REST API for the React dashboard",
+  "main": "server.js",
   "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test",
+    "test:live": "node scripts/live-test.js"
+  },
+  "keywords": [
+    "twilio",
+    "voice-bot",
+    "hindi",
+    "mongodb"
+  ],
+  "author": "Tanish Saini",
+  "license": "ISC",
   "dependencies": {
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "mongoose": "^8.24.5",
     "twilio": "^6.0.2"
   }
 }
