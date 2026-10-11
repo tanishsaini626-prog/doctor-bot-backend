@@ -12,15 +12,80 @@ function createMemoryStore(options) {
   const sessions = new Map();
   const users = [];
   const callLogs = new Map();
+  const doctors = [];
+  let clinic = null;
   let nextId = 1;
   const id = () => 'mem_' + (nextId++);
 
   const clone = (doc) => (doc ? JSON.parse(JSON.stringify(doc)) : doc);
 
+  const DEFAULT_HOURS = [
+    { day: 1, start: '09:00', end: '21:00' },
+    { day: 2, start: '09:00', end: '21:00' },
+    { day: 3, start: '09:00', end: '21:00' },
+    { day: 4, start: '09:00', end: '21:00' },
+    { day: 5, start: '09:00', end: '21:00' },
+    { day: 6, start: '09:00', end: '21:00' },
+  ];
+
   return {
     kind: 'memory',
     appointments,            // exposed for tests
     users,                   // exposed for tests
+    doctors,                 // exposed for tests
+
+    // ---------------------------------------------------------- doctors
+    async listDoctors() {
+      return doctors.slice().sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt))).map(clone);
+    },
+
+    async createDoctor(data) {
+      const doc = Object.assign({
+        _id: id(),
+        specialty: 'General Physician',
+        slot_minutes: 15,
+        working_hours: DEFAULT_HOURS,
+        holidays: [],
+        active: true,
+        createdAt: new Date().toISOString(),
+      }, data);
+      doctors.push(doc);
+      return clone(doc);
+    },
+
+    async updateDoctor(docId, data) {
+      const doc = doctors.find(d => d._id === docId);
+      if (!doc) return null;
+      Object.assign(doc, data, { updatedAt: new Date().toISOString() });
+      return clone(doc);
+    },
+
+    async deleteDoctor(docId) {
+      const i = doctors.findIndex(d => d._id === docId);
+      if (i === -1) return false;
+      doctors.splice(i, 1);
+      return true;
+    },
+
+    // ----------------------------------------------------------- clinic
+    async getClinic() {
+      return clinic ? clone(clinic) : null;
+    },
+
+    async saveClinic(data) {
+      clinic = Object.assign({
+        _id: 'clinic_1',
+        name: 'Dr. Sharma Clinic',
+        phone: '',
+        whatsapp_to: '',
+        greeting_text: 'नमस्ते! मैं डॉ. शर्मा क्लिनिक से बोल रही हूँ। अपॉइंटमेंट बुक करने के लिए कृपया अपना पूरा नाम बताइए।',
+        languages: ['hi-IN'],
+        timezone: 'Asia/Kolkata',
+        active: true,
+        createdAt: (clinic && clinic.createdAt) || new Date().toISOString(),
+      }, clinic || {}, data, { updatedAt: new Date().toISOString() });
+      return clone(clinic);
+    },
 
     // ------------------------------------------------------------- users
     async countUsers() { return users.length; },

@@ -46,6 +46,38 @@ const CallSession = mongoose.model('CallSession', SessionSchema);
 
 function createMongoStore() {
   return {
+    // ---------------------------------------------------------- doctors
+    async listDoctors() {
+      return Doctor.find({}).sort({ createdAt: 1 }).lean();
+    },
+
+    async createDoctor(data) {
+      return (await Doctor.create(data)).toObject();
+    },
+
+    async updateDoctor(docId, data) {
+      return Doctor.findByIdAndUpdate(docId, { $set: data }, { new: true }).lean();
+    },
+
+    async deleteDoctor(docId) {
+      const removed = await Doctor.findByIdAndDelete(docId);
+      return !!removed;
+    },
+
+    // ----------------------------------------------------------- clinic
+    // One clinic document per install for now; multi-clinic adds a clinicId.
+    async getClinic() {
+      return Clinic.findOne({}).sort({ createdAt: 1 }).lean();
+    },
+
+    async saveClinic(data) {
+      const existing = await Clinic.findOne({}).sort({ createdAt: 1 });
+      if (existing) {
+        return Clinic.findByIdAndUpdate(existing._id, { $set: data }, { new: true }).lean();
+      }
+      return (await Clinic.create(data)).toObject();
+    },
+
     // ------------------------------------------------------------- users
     async countUsers() {
       return User.countDocuments({});

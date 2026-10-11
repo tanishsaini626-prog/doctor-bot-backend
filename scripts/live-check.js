@@ -271,6 +271,71 @@ const spoken = (xml) => {
   check('the bot action is recorded', bookingCall?.turns?.some(t => t.bot_action === 'booked'), JSON.stringify(bookingCall?.turns?.map(t => t.bot_action)));
   check('the emergency call is logged too', calls.some(c => c.call_sid === 'CA-live-emg'));
 
+  console.log('\n=== 17. Doctors CRUD ===');
+  const auth = { Authorization: 'Bearer ' + session.token };
+  const json = { 'Content-Type': 'application/json', ...auth };
+
+  check('doctors list starts empty', (await (await fetch(BASE + '/api/doctors', { headers: auth })).json()).length === 0);
+  check('doctors are private', (await fetch(BASE + '/api/doctors')).status === 401);
+
+  const noName = await fetch(BASE + '/api/doctors', { method: 'POST', headers: json, body: JSON.stringify({ specialty: 'Dentist' }) });
+  check('a doctor without a name is rejected', noName.status === 400);
+  const badSlot = await fetch(BASE + '/api/doctors', { method: 'POST', headers: json, body: JSON.stringify({ name: 'Dr. Verma', slot_minutes: 999 }) });
+  check('an impossible slot length is rejected', badSlot.status === 400);
+
+  const created = await (await fetch(BASE + '/api/doctors', {
+    method: 'POST', headers: json,
+    body: JSON.stringify({ name: 'Dr. Meera Verma', specialty: 'Dentist', slot_minutes: 20 }),
+  })).json();
+  check('a doctor can be created', created.name === 'Dr. Meera Verma' && created._id, JSON.stringify(created.error || ''));
+  check('slot length is stored', created.slot_minutes === 20);
+
+  const patchedDoc = await (await fetch(BASE + '/api/doctors/' + created._id, {
+    method: 'PATCH', headers: json, body: JSON.stringify({ specialty: 'Orthodontist', slot_minutes: 30 }),
+  })).json();
+  check('a doctor can be updated', patchedDoc.specialty === 'Orthodontist' && patchedDoc.slot_minutes === 30);
+  check('one doctor is listed now', (await (await fetch(BASE + '/api/doctors', { headers: auth })).json()).length === 1);
+  const missingDoc = await fetch(BASE + '/api/doctors/does-not-exist', { method: 'PATCH', headers: json, body: JSON.stringify({ name: 'X' }) });
+  check('updating an unknown doctor returns 404', missingDoc.status === 404);
+  check('a doctor can be deleted', (await (await fetch(BASE + '/api/doctors/' + created._id, { method: 'DELETE', headers: auth })).json()).deleted === true);
+  check('the list is empty again', (await (await fetch(BASE + '/api/doctors', { headers: auth })).json()).length === 0);
+
+  console.log('\n=== 18. Clinic settings ===');
+  const clinic = await (await fetch(BASE + '/api/clinic', { headers: auth })).json();
+  check('clinic settings have a default name', !!clinic.name, JSON.stringify(clinic.name));
+  check('clinic settings are private', (await fetch(BASE + '/api/clinic')).status === 401);
+  check('an empty greeting is rejected', (await fetch(BASE + '/api/clinic', {
+    method: 'PATCH', headers: json, body: JSON.stringify({ greeting_text: '   ' }),
+  })).status === 400);
+
+  const savedClinic = await (await fetch(BASE + '/api/clinic', {
+    method: 'PATCH', headers: json,
+    body: JSON.stringify({ name: 'Sunrise Clinic', whatsapp_to: 'whatsapp:+919760849372', languages: ['hi-IN', 'en-IN'] }),
+  })).json();
+  check('clinic settings save', savedClinic.name === 'Sunrise Clinic', savedClinic.name);
+  check('languages are stored as a list', Array.isArray(savedClinic.languages) && savedClinic.languages.length === 2);
+  const reread = await (await fetch(BASE + '/api/clinic', { headers: auth })).json();
+  check('saved settings are read back', reread.name === 'Sunrise Clinic' && reread.whatsapp_to === 'whatsapp:+919760849372');
+
+  console.log('\n=== 19. Analytics ===');
+  check('analytics are private', (await fetch(BASE + '/api/analytics')).status === 401);
+  const analytics = await (await fetch(BASE + '/api/analytics', { headers: auth })).json();
+  check('analytics returns 14 day buckets', analytics.perDay?.length === 14, 'buckets: ' + analytics.perDay?.length);
+  check('today bucket counts the bookings', analytics.perDay[13].bookings >= 3, 'bookings today: ' + analytics.perDay[13].bookings);
+  check('calls are counted per day', analytics.perDay[13].calls >= 3, 'calls today: ' + analytics.perDay[13].calls);
+  check('totals include a conversion rate', typeof analytics.totals.conversion === 'number', JSON.stringify(analytics.totals));
+  check('peak hours are derived from the time slot', analytics.hours.some(h => /^\d{2}:00$/.test(h.hour)), JSON.stringify(analytics.hours));
+  check('top reasons are grouped', analytics.reasons.some(r => r.reason === 'Fever'), JSON.stringify(analytics.reasons));
+  check('status breakdown is present', analytics.statuses.some(s => s.status === 'Emergency'));
+
+  console.log('\n=== 20. Patients grouped by phone ===');
+  check('patients are private', (await fetch(BASE + '/api/patients')).status === 401);
+  const patients = await (await fetch(BASE + '/api/patients', { headers: auth })).json();
+  check('patients are grouped, not one row per booking', patients.length < (analytics.totals.appointments), 'patients: ' + patients.length + ' vs appointments: ' + analytics.totals.appointments);
+  check('each patient carries a visit count', patients.every(p => p.visits >= 1));
+  check('each patient carries history', patients.every(p => Array.isArray(p.history) && p.history.length === p.visits));
+  check('the newest patient is first', patients.length > 1 ? String(patients[0].lastVisit) >= String(patients[1].lastVisit) : true);
+
   console.log('\n' + '='.repeat(58));
   console.log(`RESULT: ${passed} passed, ${failures.length} failed`);
   if (failures.length) { console.log('\nFailures:'); failures.forEach(f => console.log(' - ' + f)); }

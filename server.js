@@ -50,7 +50,8 @@ let activeStore = createMemoryStore();
 let storeKind = 'memory';
 const DELEGATED = ['getSession', 'saveSession', 'clearSession', 'findDuplicate', 'countBooked',
   'createAppointment', 'listAppointments', 'getAppointment', 'updateAppointmentStatus', 'stats',
-  'countUsers', 'findUserByEmail', 'createUser', 'updateUserPassword', 'logCallTurn', 'listCallLogs'];
+  'countUsers', 'findUserByEmail', 'createUser', 'updateUserPassword', 'logCallTurn', 'listCallLogs',
+  'listDoctors', 'createDoctor', 'updateDoctor', 'deleteDoctor', 'getClinic', 'saveClinic'];
 const store = {};
 for (const method of DELEGATED) {
   store[method] = (...args) => activeStore[method](...args);
@@ -147,6 +148,80 @@ function twiml(res, xml, code = 200) {
 
 // ---- 4b. Twilio signature check (used on all three webhook routes) -------
 const twilioSignature = requireTwilioSignature();
+
+// ---- 4c. analytics -------------------------------------------------------
+// Computed in JS so it behaves identically on MongoDB and the memory store.
+// Clinic-scale data is small; if it grows, move this into an aggregation.
+const DAY_COUNT = 14;
+
+function dayKey(value) {
+  const d = value ? new Date(value) : null;
+  return d && !isNaN(d.getTime()) ? d.toISOString().slice(0, 10) : null;
+}
+
+function buildAnalytics(appointments, calls) {
+  const today = new Date();
+  const days = [];
+  for (let i = DAY_COUNT - 1; i >= 0; i--) {
+    const d = new Date(today);
+    d.setDate(d.getDate() - i);
+    const key = d.toISOString().slice(0, 10);
+    days.push({
+      date: key,
+      label: d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }),
+      calls: 0,
+      bookings: 0,
+    });
+  }
+  const byDay = new Map(days.map(d => [d.date, d]));
+
+  for (const call of calls) {
+    const bucket = byDay.get(dayKey(call.createdAt));
+    if (bucket) bucket.calls += 1;
+  }
+  for (const appt of appointments) {
+    const bucket = byDay.get(dayKey(appt.createdAt));
+    if (bucket) bucket.bookings += 1;
+  }
+
+  const hours = new Map();
+  for (const appt of appointments) {
+    const slot = String(appt.time_slot_display || appt.time_slot || '');
+    const match = slot.match(/(\d{1,2}):(\d{2})/);
+    const label = match
+      ? String(parseInt(match[1], 10)).padStart(2, '0') + ':00'
+      : (slot.split(' ')[0] || 'Unknown');
+    hours.set(label, (hours.get(label) || 0) + 1);
+  }
+
+  const reasons = new Map();
+  for (const appt of appointments) {
+    const reason = (appt.reason || 'Not specified').split(',')[0].trim();
+    reasons.set(reason, (reasons.get(reason) || 0) + 1);
+  }
+
+  const statuses = new Map();
+  for (const appt of appointments) {
+    const status = appt.status || 'Confirmed';
+    statuses.set(status, (statuses.get(status) || 0) + 1);
+  }
+
+  const booked = appointments.filter(a => a.status === 'Confirmed' || a.status === 'Completed').length;
+
+  return {
+    totals: {
+      appointments: appointments.length,
+      calls: calls.length,
+      booked,
+      emergency: appointments.filter(a => a.status === 'Emergency').length,
+      conversion: calls.length ? Math.round((booked / calls.length) * 100) : 0,
+    },
+    perDay: days,
+    hours: [...hours.entries()].map(([hour, count]) => ({ hour, count })).sort((a, b) => a.hour.localeCompare(b.hour)),
+    reasons: [...reasons.entries()].map(([reason, count]) => ({ reason, count })).sort((a, b) => b.count - a.count).slice(0, 8),
+    statuses: [...statuses.entries()].map(([status, count]) => ({ status, count })).sort((a, b) => b.count - a.count),
+  };
+}
 
 // ---- 5. routes ----------------------------------------------------------
 // Login / register (public)
@@ -294,6 +369,151 @@ app.get('/api/calls', private_api, async (req, res) => {
   } catch (err) {
     console.error('Call log list failed:', err.message);
     res.status(500).json({ error: 'Could not load call logs' });
+  }
+});
+
+// ---- doctors -------------------------------------------------------------
+app.get('/api/doctors', private_api, async (req, res) => {
+  try {
+    res.json(await store.listDoctors());
+  } catch (err) {
+    res.status(500).json({ error: 'Could not load doctors' });
+  }
+});
+
+app.post('/api/doctors', private_api, async (req, res) => {
+  const body = req.body || {};
+  if (!body.name || !String(body.name).trim()) {
+    return res.status(400).json({ error: 'Doctor name is required' });
+  }
+  const slot = parseInt(body.slot_minutes, 10);
+  if (body.slot_minutes !== undefined && (!slot || slot < 5 || slot > 120)) {
+    return res.status(400).json({ error: 'slot_minutes must be between 5 and 120' });
+  }
+  try {
+    const doctor = await store.createDoctor({
+      name: String(body.name).trim(),
+      specialty: body.specialty ? String(body.specialty).trim() : 'General Physician',
+      slot_minutes: slot || 15,
+      working_hours: Array.isArray(body.working_hours) ? body.working_hours : undefined,
+      holidays: Array.isArray(body.holidays) ? body.holidays : [],
+      active: body.active !== false,
+    });
+    res.status(201).json(doctor);
+  } catch (err) {
+    res.status(500).json({ error: 'Could not create the doctor' });
+  }
+});
+
+app.patch('/api/doctors/:id', private_api, async (req, res) => {
+  const body = req.body || {};
+  const patch = {};
+  if (body.name !== undefined) {
+    if (!String(body.name).trim()) return res.status(400).json({ error: 'Doctor name cannot be empty' });
+    patch.name = String(body.name).trim();
+  }
+  if (body.specialty !== undefined) patch.specialty = String(body.specialty).trim();
+  if (body.slot_minutes !== undefined) {
+    const slot = parseInt(body.slot_minutes, 10);
+    if (!slot || slot < 5 || slot > 120) return res.status(400).json({ error: 'slot_minutes must be between 5 and 120' });
+    patch.slot_minutes = slot;
+  }
+  if (body.working_hours !== undefined) patch.working_hours = body.working_hours;
+  if (body.holidays !== undefined) patch.holidays = body.holidays;
+  if (body.active !== undefined) patch.active = !!body.active;
+  if (!Object.keys(patch).length) return res.status(400).json({ error: 'Nothing to update' });
+  try {
+    const updated = await store.updateDoctor(req.params.id, patch);
+    if (!updated) return res.status(404).json({ error: 'Doctor not found' });
+    res.json(updated);
+  } catch (err) {
+    res.status(400).json({ error: 'Could not update the doctor' });
+  }
+});
+
+app.delete('/api/doctors/:id', private_api, async (req, res) => {
+  try {
+    const removed = await store.deleteDoctor(req.params.id);
+    if (!removed) return res.status(404).json({ error: 'Doctor not found' });
+    res.json({ deleted: true });
+  } catch (err) {
+    res.status(400).json({ error: 'Could not delete the doctor' });
+  }
+});
+
+// ---- clinic settings -----------------------------------------------------
+app.get('/api/clinic', private_api, async (req, res) => {
+  try {
+    const clinic = await store.getClinic();
+    res.json(clinic || {
+      name: 'Dr. Sharma Clinic', phone: '', whatsapp_to: '',
+      greeting_text: 'नमस्ते! मैं डॉ. शर्मा क्लिनिक से बोल रही हूँ। अपॉइंटमेंट बुक करने के लिए कृपया अपना पूरा नाम बताइए।',
+      languages: ['hi-IN'], timezone: 'Asia/Kolkata',
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not load the clinic' });
+  }
+});
+
+app.patch('/api/clinic', private_api, async (req, res) => {
+  const body = req.body || {};
+  const patch = {};
+  for (const field of ['name', 'phone', 'whatsapp_to', 'greeting_text', 'timezone']) {
+    if (body[field] !== undefined) patch[field] = String(body[field]);
+  }
+  if (body.languages !== undefined) {
+    if (!Array.isArray(body.languages)) return res.status(400).json({ error: 'languages must be an array' });
+    patch.languages = body.languages.map(String);
+  }
+  if (body.greeting_text !== undefined && !String(body.greeting_text).trim()) {
+    return res.status(400).json({ error: 'The greeting cannot be empty' });
+  }
+  if (!Object.keys(patch).length) return res.status(400).json({ error: 'Nothing to update' });
+  try {
+    res.json(await store.saveClinic(patch));
+  } catch (err) {
+    res.status(500).json({ error: 'Could not save the clinic settings' });
+  }
+});
+
+// ---- analytics -----------------------------------------------------------
+app.get('/api/analytics', private_api, async (req, res) => {
+  try {
+    const [appointments, calls] = await Promise.all([
+      store.listAppointments({ limit: 500 }),
+      store.listCallLogs({ limit: 500 }),
+    ]);
+    res.json(buildAnalytics(appointments, calls));
+  } catch (err) {
+    console.error('Analytics failed:', err.message);
+    res.status(500).json({ error: 'Could not build analytics' });
+  }
+});
+
+// ---- patients (grouped by phone, with visit history) ---------------------
+app.get('/api/patients', private_api, async (req, res) => {
+  try {
+    const appointments = await store.listAppointments({ limit: 500 });
+    const byPhone = new Map();
+    for (const appt of appointments) {
+      const phone = appt.phone || 'unknown';
+      if (!byPhone.has(phone)) {
+        byPhone.set(phone, { phone, name: appt.name || 'Unknown', visits: 0, lastVisit: null, statuses: [], history: [] });
+      }
+      const patient = byPhone.get(phone);
+      patient.visits += 1;
+      patient.history.push(appt);
+      if (!patient.lastVisit || String(appt.createdAt) > String(patient.lastVisit)) {
+        patient.lastVisit = appt.createdAt;
+        patient.name = appt.name || patient.name;   // most recent name wins
+      }
+      if (!patient.statuses.includes(appt.status)) patient.statuses.push(appt.status);
+    }
+    const patients = [...byPhone.values()].sort((a, b) => String(b.lastVisit).localeCompare(String(a.lastVisit)));
+    res.json(patients);
+  } catch (err) {
+    console.error('Patients failed:', err.message);
+    res.status(500).json({ error: 'Could not load patients' });
   }
 });
 
