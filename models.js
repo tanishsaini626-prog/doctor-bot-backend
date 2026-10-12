@@ -72,4 +72,20 @@ const Doctor = mongoose.model('Doctor', DoctorSchema);
 const User = mongoose.model('User', UserSchema);
 const CallLog = mongoose.model('CallLog', CallLogSchema);
 
-module.exports = { Clinic, Doctor, User, CallLog };
+// Marketing-site demo requests (Phase D). Public form -> validated -> stored.
+const LeadSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  clinic: { type: String, default: '' },
+  phone: { type: String, default: '' },
+  email: { type: String, default: '' },
+  message: { type: String, default: '' },
+  source: { type: String, default: 'landing' },   // landing | referral | ...
+  consent: { type: Boolean, default: false },      // agreed to be contacted
+  ip: { type: String, default: '' },
+  user_agent: { type: String, default: '' },
+  status: { type: String, default: 'new', index: true },  // new | contacted | converted | spam
+}, { timestamps: true });
+
+const Lead = mongoose.model('Lead', LeadSchema);
+
+module.exports = { Clinic, Doctor, User, CallLog, Lead };

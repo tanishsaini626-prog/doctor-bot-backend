@@ -51,7 +51,8 @@ let storeKind = 'memory';
 const DELEGATED = ['getSession', 'saveSession', 'clearSession', 'findDuplicate', 'countBooked',
   'createAppointment', 'listAppointments', 'getAppointment', 'updateAppointmentStatus', 'stats',
   'countUsers', 'findUserByEmail', 'createUser', 'updateUserPassword', 'logCallTurn', 'listCallLogs',
-  'listDoctors', 'createDoctor', 'updateDoctor', 'deleteDoctor', 'getClinic', 'saveClinic'];
+  'listDoctors', 'createDoctor', 'updateDoctor', 'deleteDoctor', 'getClinic', 'saveClinic',
+  'createLead', 'listLeads'];
 const store = {};
 for (const method of DELEGATED) {
   store[method] = (...args) => activeStore[method](...args);
@@ -497,6 +498,111 @@ app.patch('/api/clinic', private_api, async (req, res) => {
     res.json(await store.saveClinic(patch));
   } catch (err) {
     res.status(500).json({ error: 'Could not save the clinic settings' });
+  }
+});
+
+// ---- leads (Phase D marketing site) --------------------------------------
+// Public demo-request form. No auth (it is on the public landing page), but it
+// is protected by an in-process rate limiter, a honeypot field and strict
+// server-side validation. Leads persist through the same store as everything
+// else (MongoDB when configured, in-memory otherwise).
+const LEAD_WINDOW_MS = 10 * 60 * 1000;   // 10 minutes
+const LEAD_MAX_PER_IP = 5;               // max demo requests per IP per window
+const leadHits = new Map();              // ip -> [timestamps]
+
+function leadRateLimited(ip) {
+  const now = Date.now();
+  const arr = (leadHits.get(ip) || []).filter(t => now - t < LEAD_WINDOW_MS);
+  if (arr.length >= LEAD_MAX_PER_IP) {
+    leadHits.set(ip, arr);
+    return true;
+  }
+  arr.push(now);
+  leadHits.set(ip, arr);
+  // keep the map from growing without bound
+  if (leadHits.size > 5000) {
+    for (const [k, v] of leadHits) if (!v.some(t => now - t < LEAD_WINDOW_MS)) leadHits.delete(k);
+  }
+  return false;
+}
+// Test-only seam: lets the test suite reset the limiter between cases without
+// affecting production behaviour.
+app.locals.__resetLeadLimiter = () => leadHits.clear();
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+// Accept Indian and international formats: optional +, 7-15 digits, spaces/dashes allowed.
+const cleanDigits = (s) => String(s || '').replace(/[^\d]/g, '');
+const isValidPhone = (s) => { const d = cleanDigits(s); return d.length >= 7 && d.length <= 15; };
+
+app.post('/api/leads', async (req, res) => {
+  const body = req.body || {};
+  const ip = req.ip || req.socket?.remoteAddress || '';
+
+  // Honeypot: a hidden field only bots fill in. Silently accept so bots think
+  // it worked, but do not store anything.
+  if (String(body.company_website || '').trim()) {
+    return res.status(201).json({ ok: true });
+  }
+
+  if (leadRateLimited(ip)) {
+    return res.status(429).json({ error: 'बहुत ज़्यादा requests। कृपया कुछ देर बाद कोशिश करें। (Too many requests, please try again later.)' });
+  }
+
+  const name = String(body.name || '').trim();
+  const email = String(body.email || '').trim();
+  const phone = String(body.phone || '').trim();
+  const clinic = String(body.clinic || '').trim();
+  const message = String(body.message || '').trim();
+  const consent = body.consent === true || body.consent === 'true' || body.consent === 'on';
+
+  // ---- validation (server-side; the browser check is only a convenience) --
+  if (name.length < 2 || name.length > 100) {
+    return res.status(400).json({ error: 'Please enter your name (2-100 characters).' });
+  }
+  if (!email || !EMAIL_RE.test(email) || email.length > 200) {
+    return res.status(400).json({ error: 'Please enter a valid email address.' });
+  }
+  if (!phone || !isValidPhone(phone)) {
+    return res.status(400).json({ error: 'Please enter a valid phone number.' });
+  }
+  if (clinic.length > 150) {
+    return res.status(400).json({ error: 'Clinic name is too long.' });
+  }
+  if (message.length > 2000) {
+    return res.status(400).json({ error: 'Message is too long (max 2000 characters).' });
+  }
+  if (!consent) {
+    return res.status(400).json({ error: 'Please agree to be contacted so we can respond.' });
+  }
+
+  try {
+    const lead = await store.createLead({
+      name,
+      clinic,
+      phone,
+      email: email.toLowerCase(),
+      message,
+      source: String(body.source || 'landing').slice(0, 40),
+      consent: true,
+      ip: String(ip).slice(0, 64),
+      user_agent: String(req.get('user-agent') || '').slice(0, 300),
+      status: 'new',
+    });
+    // Do not echo the whole stored doc back to a public client.
+    res.status(201).json({ ok: true, id: lead._id });
+  } catch (err) {
+    console.error('Lead capture failed:', err.message);
+    res.status(500).json({ error: 'Could not save your request. Please try again.' });
+  }
+});
+
+// Admin: view captured leads (dashboard only).
+app.get('/api/leads', private_api, async (req, res) => {
+  try {
+    res.json(await store.listLeads({ limit: req.query.limit }));
+  } catch (err) {
+    console.error('Lead list failed:', err.message);
+    res.status(500).json({ error: 'Could not load leads' });
   }
 });
 

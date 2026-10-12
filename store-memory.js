@@ -13,6 +13,7 @@ function createMemoryStore(options) {
   const users = [];
   const callLogs = new Map();
   const doctors = [];
+  const leads = [];
   let clinic = null;
   let nextId = 1;
   const id = () => 'mem_' + (nextId++);
@@ -33,6 +34,7 @@ function createMemoryStore(options) {
     appointments,            // exposed for tests
     users,                   // exposed for tests
     doctors,                 // exposed for tests
+    leads,                   // exposed for tests
 
     // ---------------------------------------------------------- doctors
     async listDoctors() {
@@ -217,6 +219,34 @@ function createMemoryStore(options) {
         abandoned: count('Abandoned'),
         today: appointments.filter(a => a.date === today).length,
       };
+    },
+
+    // ------------------------------------------------------------- leads
+    async createLead(data) {
+      const doc = Object.assign({
+        _id: id(),
+        name: '',
+        clinic: '',
+        phone: '',
+        email: '',
+        message: '',
+        source: 'landing',
+        consent: false,
+        ip: '',
+        user_agent: '',
+        status: 'new',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }, data);
+      leads.push(doc);
+      return clone(doc);
+    },
+
+    async listLeads({ limit = 200 } = {}) {
+      return leads.slice()
+        .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+        .slice(0, Math.min(Number(limit) || 200, 500))
+        .map(clone);
     },
   };
 }

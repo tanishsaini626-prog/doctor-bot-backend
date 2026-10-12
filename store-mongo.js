@@ -4,7 +4,7 @@
  * ========================================================================== */
 
 const mongoose = require('mongoose');
-const { Clinic, Doctor, User, CallLog } = require('./models');
+const { Clinic, Doctor, User, CallLog, Lead } = require('./models');
 
 const AppointmentSchema = new mongoose.Schema({
   name: { type: String, default: 'Unknown' },
@@ -184,7 +184,16 @@ function createMongoStore() {
       ]);
       return { total, confirmed, incomplete, emergency, abandoned, today };
     },
+
+    // ------------------------------------------------------------- leads
+    async createLead(data) {
+      return (await Lead.create(data)).toObject();
+    },
+
+    async listLeads({ limit = 200 } = {}) {
+      return Lead.find({}).sort({ createdAt: -1 }).limit(Math.min(Number(limit) || 200, 500)).lean();
+    },
   };
 }
 
-module.exports = { createMongoStore, Appointment, CallSession, Clinic, Doctor, User, CallLog };
+module.exports = { createMongoStore, Appointment, CallSession, Clinic, Doctor, User, CallLog, Lead };
