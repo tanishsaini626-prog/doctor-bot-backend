@@ -5,9 +5,13 @@ Target: deploy the **backend** to a free Node host (Render / Railway / Fly) and 
 persistence. Nothing here requires Twilio credits — the voice flow is tested with
 mock calls and simulated webhooks.
 
-> Data-persistence warning: without a real `MONGODB_URI` the server falls back to an
-> **in-memory** store. That is fine for local dev and tests, but **all data is lost on
-> restart**, so a real clinic must not run on it. Set up Atlas first.
+> Persistence: the backend now **persists by default without any external setup**.
+> If `MONGODB_URI` is unset, it falls back to a **file-backed store** (`STORE=auto`
+> → file), writing every change to a JSON file via an atomic temp-write + rename,
+> so bookings survive restarts. Use this for local runs and single-instance hosts
+> (one VPS / one container). For **shared / multi-instance** production, set up
+> Atlas (below) so every replica reads the same data. `STORE=memory` opts out of
+> persistence entirely (tests/demos only).
 
 ---
 
@@ -19,8 +23,14 @@ mock calls and simulated webhooks.
    no fixed IP). Lock this down later if your host offers static egress IPs.
 4. **Connect → Drivers** → copy the `mongodb+srv://...` string.
 5. Put it in the backend `.env` as `MONGODB_URI` (never commit it — `.env` is gitignored).
-6. Choose `STORE=auto` (default): uses Mongo when it connects, otherwise falls back to
-   memory so the server still boots. Use `STORE=mongo` to hard-fail if the DB is down.
+6. Keep `STORE=auto` (default): uses Mongo when it connects, otherwise falls back to
+   the file-backed store so the server always boots. Use `STORE=mongo` to hard-fail if
+   the DB is down.
+
+> **No Atlas yet?** You are not blocked. With `MONGODB_URI` unset, `STORE=auto`
+> automatically uses the durable file store at `DATA_FILE` (default
+> `.data/store.json`, gitignored). Data survives restarts on a single instance.
+> Switch to Atlas when you need a shared database across multiple instances.
 
 Verify: `GET /api/health` should show `"database": true`.
 
@@ -32,11 +42,12 @@ Set these in your host's dashboard (never in the repo):
 
 | Variable | Required | Notes |
 |---|---|---|
-| `MONGODB_URI` | **yes for persistence** | `mongodb+srv://USER:PASS@cluster.../doctorBot` |
+| `MONGODB_URI` | for shared DB | `mongodb+srv://USER:PASS@cluster.../doctorBot`; if unset, the file store is used |
 | `JWT_SECRET` | **yes** | long random string, e.g. `openssl rand -base64 48` |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | yes | first dashboard login, created on first boot |
 | `PORT` | no | host usually injects it; defaults to 5000 |
-| `STORE` | no | `auto` (default) \| `mongo` \| `memory` |
+| `STORE` | no | `auto` (default) \| `mongo` \| `file` \| `memory` |
+| `DATA_FILE` | no | where the file store writes JSON; default `.data/store.json` (only used when not on Mongo) |
 | `TWILIO_VALIDATE_SIGNATURE` | **yes before going live** | `true` rejects unsigned webhooks |
 | `TWILIO_AUTH_TOKEN` | yes when validating | from the Twilio console |
 | `TWILIO_ACCOUNT_SID`, `TWILIO_WHATSAPP_FROM`, `CLINIC_WHATSAPP_TO` | optional | WhatsApp booking alerts |
