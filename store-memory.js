@@ -36,6 +36,40 @@ function createMemoryStore(options) {
     doctors,                 // exposed for tests
     leads,                   // exposed for tests
 
+    // --------------------------------------------- persistence seams
+    // Used by store-file.js to persist state to disk without duplicating any
+    // of the logic above. Not part of the Twilio/API surface.
+    __snapshot() {
+      return {
+        appointments,
+        sessions: [...sessions.entries()],   // Map -> array of [key, value]
+        users,
+        callLogs: [...callLogs.entries()],
+        doctors,
+        leads,
+        clinic,
+        nextId,
+      };
+    },
+
+    __hydrate(snapshot) {
+      if (!snapshot || typeof snapshot !== 'object') return;
+      if (Array.isArray(snapshot.appointments)) appointments.splice(0, appointments.length, ...snapshot.appointments);
+      if (Array.isArray(snapshot.sessions)) {
+        sessions.clear();
+        for (const [k, v] of snapshot.sessions) sessions.set(k, v);
+      }
+      if (Array.isArray(snapshot.users)) users.splice(0, users.length, ...snapshot.users);
+      if (Array.isArray(snapshot.callLogs)) {
+        callLogs.clear();
+        for (const [k, v] of snapshot.callLogs) callLogs.set(k, v);
+      }
+      if (Array.isArray(snapshot.doctors)) doctors.splice(0, doctors.length, ...snapshot.doctors);
+      if (Array.isArray(snapshot.leads)) leads.splice(0, leads.length, ...snapshot.leads);
+      if (snapshot.clinic !== undefined) clinic = snapshot.clinic;
+      if (Number.isFinite(snapshot.nextId) && snapshot.nextId > nextId) nextId = snapshot.nextId;
+    },
+
     // ---------------------------------------------------------- doctors
     async listDoctors() {
       return doctors.slice().sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt))).map(clone);

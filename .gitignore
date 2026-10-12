@@ -16,6 +16,9 @@ n8n-doctor-bot-*.json
 node_modules/
 npm-debug.log*
 
+# File-backed store data (STORE=file) - runtime data, never commit
+.data/
+
 # Editor / OS
 .vscode/
 .idea/

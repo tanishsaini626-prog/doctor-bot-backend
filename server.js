@@ -24,18 +24,22 @@ require('dotenv').config({ path: ['.env', 'doctor.env', '.env.local'] });
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
+const path = require('path');
 
 const BotEngine = require('./bot-engine');
 const { createConversation } = require('./conversation');
 const { createMongoStore } = require('./store-mongo');
 const { createMemoryStore } = require('./store-memory');
+const { createFileStore } = require('./store-file');
 const { createAuth, requireAuth, ensureSeedAdmin } = require('./auth');
 const { requireTwilioSignature } = require('./twilio-signature');
 
 const PORT = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI || '';
 const MAX_PER_SLOT = parseInt(process.env.MAX_PER_SLOT || '0', 10);   // 0 = unlimited
-const STORE_MODE = (process.env.STORE || 'auto').toLowerCase();       // auto | mongo | memory
+const STORE_MODE = (process.env.STORE || 'auto').toLowerCase();       // auto | mongo | file | memory
+// Where the file-backed store keeps its JSON (ignored by git via .data/).
+const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, '.data', 'store.json');
 
 const app = express();
 app.set('trust proxy', 1);                       // correct https:// behind ngrok / Render
@@ -59,7 +63,7 @@ for (const method of DELEGATED) {
 }
 
 function storeReady() {
-  return storeKind === 'memory' || mongoose.connection.readyState === 1;
+  return storeKind === 'memory' || storeKind === 'file' || mongoose.connection.readyState === 1;
 }
 
 async function initStore() {
@@ -67,9 +71,18 @@ async function initStore() {
     console.log('🧠 STORE=memory - using the in-memory store (data is lost on restart)');
     return;
   }
+  if (STORE_MODE === 'file') {
+    activeStore = createFileStore(DATA_FILE);
+    storeKind = 'file';
+    console.log('💾 STORE=file - data persists to ' + DATA_FILE + ' (survives restarts)');
+    return;
+  }
   if (!MONGODB_URI) {
-    console.warn('⚠️  MONGODB_URI is not set - using the in-memory store instead.');
-    console.warn('    Copy .env.example to .env and add your Atlas connection string to persist data.');
+    activeStore = createFileStore(DATA_FILE);
+    storeKind = 'file';
+    console.warn('⚠️  MONGODB_URI is not set - using the file-backed store instead (' + DATA_FILE + ').');
+    console.warn('    Data survives restarts on this machine. Set MONGODB_URI (free M0 cluster on');
+    console.warn('    cloud.mongodb.com) for a shared database, or STORE=memory to opt out of persistence.');
     return;
   }
   try {
@@ -83,8 +96,10 @@ async function initStore() {
       console.error('   STORE=mongo was requested, so the server will not start.');
       process.exit(1);
     }
-    console.warn('⚠️  Falling back to the in-memory store - bookings will NOT be saved to a database.');
-    console.warn('    Fix MONGODB_URI in .env (create a free M0 cluster on cloud.mongodb.com) and restart.');
+    activeStore = createFileStore(DATA_FILE);
+    storeKind = 'file';
+    console.warn('⚠️  Falling back to the file-backed store (' + DATA_FILE + ') - bookings persist on this machine.');
+    console.warn('    Fix MONGODB_URI in .env (create a free M0 cluster on cloud.mongodb.com) and restart for a shared DB.');
   }
 }
 
@@ -257,7 +272,7 @@ app.get('/', (req, res) => {
     service: 'MediBot backend',
     status: 'ok',
     store: storeKind,
-    database: storeKind === 'memory' ? 'in-memory (not persistent)' : (mongoose.connection.readyState === 1 ? 'connected' : 'connecting'),
+    database: storeKind === 'memory' ? 'in-memory (not persistent)' : (storeKind === 'file' ? 'file-backed (persistent on this host)' : (mongoose.connection.readyState === 1 ? 'connected' : 'connecting')),
     signature_validation: String(process.env.TWILIO_VALIDATE_SIGNATURE || '').toLowerCase() === 'true',
     endpoints: ['/webhook/doctor-bot', '/webhook/status', '/api/auth/login', '/api/appointments', '/api/calls', '/api/stats'],
   });
@@ -267,7 +282,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
     store: storeKind,
-    database: mongoose.connection.readyState === 1,
+    database: storeKind === 'mongo' ? (mongoose.connection.readyState === 1) : (storeKind !== 'memory'),
     uptime_seconds: Math.round(process.uptime()),
   });
 });
@@ -663,7 +678,7 @@ if (require.main === module) {
   app.listen(PORT, () => {
     console.log('===================================');
     console.log('MediBot backend running on port ' + PORT);
-    console.log('Storage:', storeKind === 'mongo' ? 'MongoDB' : 'in-memory');
+    console.log('Storage:', storeKind === 'mongo' ? 'MongoDB' : storeKind === 'file' ? 'file-backed (' + DATA_FILE + ')' : 'in-memory');
     console.log('Twilio webhook: POST /webhook/doctor-bot');
     console.log('Signature validation:', String(process.env.TWILIO_VALIDATE_SIGNATURE || '').toLowerCase() === 'true' ? 'ON' : 'off (set TWILIO_VALIDATE_SIGNATURE=true before going live)');
     console.log('Slot cap:', MAX_PER_SLOT > 0 ? MAX_PER_SLOT + ' per slot' : 'unlimited');
