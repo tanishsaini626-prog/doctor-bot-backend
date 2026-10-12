@@ -87,7 +87,31 @@ async function initStore() {
   }
 }
 
-const bot = createConversation({ store, maxPerSlot: MAX_PER_SLOT });
+// The voice bot reads the booking back and waits for "haan/sahi" before it
+// saves. Set CONFIRM_BEFORE_BOOKING=false in .env to book the instant every
+// slot is collected (the old, no-read-back behaviour).
+const CONFIRM_BEFORE_BOOKING = String(process.env.CONFIRM_BEFORE_BOOKING || 'true').toLowerCase() !== 'false';
+
+// Doctor availability for the voice flow: the first active doctor's working
+// hours + holidays. If the clinic has not added a doctor yet we return null and
+// the availability check is skipped, so a fresh install still books normally.
+async function doctorProvider() {
+  try {
+    const doctors = await store.listDoctors();
+    const active = (doctors || []).filter(d => d.active !== false);
+    return active[0] || null;
+  } catch (err) {
+    console.error('doctorProvider failed:', err.message);
+    return null;
+  }
+}
+
+const bot = createConversation({
+  store,
+  maxPerSlot: MAX_PER_SLOT,
+  confirmBeforeBooking: CONFIRM_BEFORE_BOOKING,
+  doctorProvider,
+});
 const { router: authRouter } = createAuth(store);
 
 // ---- 2b. admin account ---------------------------------------------------

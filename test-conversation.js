@@ -65,10 +65,10 @@ test('incoming call gets a Hindi greeting with a Gather', () => {
 });
 
 // -------------------------------------------------------------- happy paths
-test('a full 4-turn call books exactly one appointment', async () => {
+test('a full 4-turn call books exactly one appointment after confirmation', async () => {
   const store = createMemoryStore();
   const bot = makeBot(store);
-  const call = await talk(bot, store, ['mera naam Priya Sharma hai', 'kal', 'subah 10 baje', 'bukhar hai']);
+  const call = await talk(bot, store, ['mera naam Priya Sharma hai', 'kal', 'subah 10 baje', 'bukhar hai', 'haan sahi hai']);
 
   assert.equal(call.last.ended, true);
   assert.equal(call.last.status, 'Confirmed');
@@ -81,10 +81,25 @@ test('a full 4-turn call books exactly one appointment', async () => {
   assert.equal(store.appointments[0].status, 'Confirmed');
 });
 
+test('the bot reads the booking back and only saves after the caller agrees', async () => {
+  const store = createMemoryStore();
+  const bot = makeBot(store);
+  // First turn collects everything but must NOT save yet - it asks "Sahi hai?".
+  const readback = await bot.handleTurn({
+    callSid: 'CA-rb', from: '+919760849372',
+    transcript: 'mera naam Riya hai, kal shaam 5 baje khansi ke liye',
+    actionUrl: 'https://x.test/webhook/doctor-bot',
+  });
+  assert.equal(readback.ended, false);
+  assert.equal(readback.awaiting_confirm, true);
+  assert.match(readback.twiml, /सही है/);
+  assert.equal(store.appointments.length, 0);        // nothing saved before confirmation
+});
+
 test('one sentence is enough to book immediately', async () => {
   const store = createMemoryStore();
   const bot = makeBot(store);
-  const call = await talk(bot, store, ['mera naam Riya hai, kal shaam 5 baje khansi ke liye']);
+  const call = await talk(bot, store, ['mera naam Riya hai, kal shaam 5 baje khansi ke liye', 'haan sahi hai']);
   assert.equal(call.last.status, 'Confirmed');
   assert.equal(store.appointments[0].time_slot, 'Evening 17:00');
 });
@@ -93,7 +108,7 @@ test('the clinic WhatsApp text is built correctly', async () => {
   const store = createMemoryStore();
   const bot = makeBot(store);
   let sentBody = null;
-  const call = await talk(bot, store, ['mera naam Riya hai, kal shaam 5 baje khansi ke liye']);
+  const call = await talk(bot, store, ['mera naam Riya hai, kal shaam 5 baje khansi ke liye', 'haan sahi hai']);
   sentBody = bot.whatsappText(call.last.appointment);
   assert.match(sentBody, /Patient Name: Riya/);
   assert.match(sentBody, /Time Slot: Evening 17:00/);
@@ -106,7 +121,7 @@ test('the clinic WhatsApp text is built correctly', async () => {
 test('the same caller cannot book the same slot twice', async () => {
   const store = createMemoryStore();
   const bot = makeBot(store);
-  await talk(bot, store, ['mera naam Riya hai, kal subah 10 baje bukhar ke liye']);
+  await talk(bot, store, ['mera naam Riya hai, kal subah 10 baje bukhar ke liye', 'haan sahi hai']);
   const second = await talk(bot, store, ['mera naam Riya hai, kal subah 10 baje bukhar ke liye']);
 
   assert.equal(second.last.duplicate, true);
@@ -119,7 +134,7 @@ test('a full slot sends the caller back to pick another time', async () => {
   const store = createMemoryStore();
   const bot = makeBot(store, { maxPerSlot: 1 });
 
-  await talk(bot, store, ['mera naam Riya hai, kal subah 10 baje bukhar ke liye'], '+911111111111');
+  await talk(bot, store, ['mera naam Riya hai, kal subah 10 baje bukhar ke liye', 'haan sahi hai'], '+911111111111');
   const second = await talk(bot, store, ['mera naam Amit hai, kal subah 10 baje bukhar ke liye'], '+912222222222');
 
   assert.equal(second.last.ended, false);             // still on the call
@@ -178,7 +193,7 @@ test('three fruitless turns save the partial row as Incomplete', async () => {
 test('a correction replaces the earlier answer', async () => {
   const store = createMemoryStore();
   const bot = makeBot(store);
-  const call = await talk(bot, store, ['mera naam Priya hai', 'kal subah 10 baje', 'nahi, shaam 5 baje', 'bukhar hai']);
+  const call = await talk(bot, store, ['mera naam Priya hai', 'kal subah 10 baje', 'nahi, shaam 5 baje', 'bukhar hai', 'haan sahi hai']);
   assert.equal(call.last.status, 'Confirmed');
   assert.equal(store.appointments[0].time_slot, 'Evening 17:00');
 });
@@ -209,4 +224,121 @@ test('the store is told about every talking turn so a hang-up keeps the data', a
   assert.equal(session.name, 'Priya');
   assert.equal(session.asked_field, 'date');
   assert.equal(session.attempt, 1);
+});
+
+// ------------------------------------------------- confirmation read-back loop
+test('saying "nahi" to the read-back re-opens date+time and never saves a wrong row', async () => {
+  const store = createMemoryStore();
+  const bot = makeBot(store);
+  // Collect everything -> read-back -> "nahi" -> new date/time -> "haan" -> booked.
+  const call = await talk(bot, store, [
+    'mera naam Priya hai',
+    'kal subah 10 baje',
+    'bukhar hai',
+    'nahi',                 // reject the read-back
+    'parso shaam 5 baje',   // corrected date + time
+    'haan sahi hai',
+  ]);
+  assert.equal(call.last.status, 'Confirmed');
+  assert.equal(store.appointments.length, 1);
+  assert.equal(store.appointments[0].date, '24/06/2026');       // parso, not kal
+  assert.equal(store.appointments[0].time_slot, 'Evening 17:00');
+  // The rejected "kal 10:00" must never have been written.
+  assert.equal(store.appointments.some(a => a.time_slot === 'Morning 10:00'), false);
+});
+
+test('an unclear answer repeats the read-back and still saves nothing', async () => {
+  const store = createMemoryStore();
+  const bot = makeBot(store);
+  const call = await talk(bot, store, [
+    'mera naam Priya hai, kal subah 10 baje bukhar ke liye',
+    'kya matlab',           // not a yes/no
+  ]);
+  assert.equal(call.last.ended, false);
+  assert.equal(call.last.awaiting_confirm, true);
+  assert.match(call.last.twiml, /सही है/);
+  assert.equal(store.appointments.length, 0);
+});
+
+// ------------------------------------------------- doctor availability checks
+// Doctor works Tue(2)..Sat(6) 09:00-17:00, off Sunday(0) and Monday(1),
+// and 2026-06-25 is a holiday.
+const DOCTOR = {
+  name: 'Dr. Sharma',
+  working_hours: [
+    { day: 2, start: '09:00', end: '17:00' },
+    { day: 3, start: '09:00', end: '17:00' },
+    { day: 4, start: '09:00', end: '17:00' },
+    { day: 5, start: '09:00', end: '17:00' },
+    { day: 6, start: '09:00', end: '17:00' },
+  ],
+  holidays: ['2026-06-25'],
+};
+const doctorProvider = async () => DOCTOR;
+
+test('doctor off that weekday is told to pick another day', async () => {
+  const store = createMemoryStore();
+  const bot = makeBot(store, { doctorProvider });
+  // today is Mon 22 Jun; "parso" = Wed 24 (works). Use "kal" = Tue 23 (works).
+  // Monday 29 Jun ("agle hafte") is a day the doctor does NOT work.
+  const call = await talk(bot, store, [
+    'mera naam Priya hai',
+    'agle hafte',           // Mon 29 Jun -> doctor off
+    'subah 10 baje',
+    'bukhar hai',
+  ]);
+  const last = call.turns[call.turns.length - 1];
+  assert.equal(last.ended, false);
+  assert.equal(last.asked_field, 'date');                 // sent back to the date
+  assert.match(last.twiml, /उपलब्ध नहीं/);                 // doctor_off hint
+  assert.equal(store.appointments.length, 0);
+});
+
+test('a doctor holiday refuses the date and asks for another day', async () => {
+  const store = createMemoryStore();
+  const bot = makeBot(store, { doctorProvider });
+  // 25 Jun 2026 is a Thursday and a holiday.
+  const call = await talk(bot, store, [
+    'mera naam Priya hai',
+    '25 june',
+    'subah 10 baje',
+    'bukhar hai',
+  ]);
+  const last = call.turns[call.turns.length - 1];
+  assert.equal(last.ended, false);
+  assert.equal(last.asked_field, 'date');
+  assert.match(last.twiml, /बंद रहता है/);                  // closed_day hint
+  assert.equal(store.appointments.length, 0);
+});
+
+test('a time outside the doctor working hours is sent back to the time slot', async () => {
+  const store = createMemoryStore();
+  const bot = makeBot(store, { doctorProvider });
+  // Tue 23 Jun works 09:00-17:00; shaam 8 baje = 20:00 is after hours.
+  const call = await talk(bot, store, [
+    'mera naam Priya hai',
+    'kal',
+    'shaam 8 baje',
+    'bukhar hai',
+  ]);
+  const last = call.turns[call.turns.length - 1];
+  assert.equal(last.ended, false);
+  assert.equal(last.asked_field, 'time_slot');             // only the time re-opened
+  assert.match(last.twiml, /उपलब्ध नहीं/);                  // doctor_off hint
+  assert.equal(store.appointments.length, 0);
+});
+
+test('a valid slot inside the doctor hours still books after confirmation', async () => {
+  const store = createMemoryStore();
+  const bot = makeBot(store, { doctorProvider });
+  const call = await talk(bot, store, [
+    'mera naam Priya hai',
+    'kal',                    // Tue 23 Jun, inside 09:00-17:00
+    'subah 10 baje',
+    'bukhar hai',
+    'haan sahi hai',
+  ]);
+  assert.equal(call.last.status, 'Confirmed');
+  assert.equal(store.appointments.length, 1);
+  assert.equal(store.appointments[0].date, '23/06/2026');
 });

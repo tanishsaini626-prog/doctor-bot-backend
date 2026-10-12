@@ -30,6 +30,33 @@ function confirmationSpeech(slots) {
     'क्लिनिक पहुँचने से 10 मिनट पहले आ जाइए। धन्यवाद!';
 }
 
+/** The read-back the caller must confirm before we save: "Sahi hai?" */
+function readbackSpeech(slots) {
+  const forSpeech = RELATION_HINDI[slots.booking_for] || '';
+  return (slots.name || 'आप') + ' जी, एक बार सुनिए — ' +
+    (slots.date_speech || slots.date) + ' को ' +
+    (slots.time_slot_speech || slots.time_slot) + ', ' +
+    (slots.reason || 'जाँच') + ' के लिए। ' +
+    (forSpeech ? forSpeech + ' की ' : '') +
+    'अपॉइंटमेंट बुक कर दूँ? सही है?';
+}
+
+/** Is this 24h HH:MM inside any of the doctor's working hours for that weekday? */
+function slotWithinHours(slot, workingHours) {
+  if (!Array.isArray(workingHours) || workingHours.length === 0) return true;  // no hours = always open
+  const match = /(\d{1,2}):(\d{2})$/.exec(String(slot || ''));
+  if (!match) return true;                                    // window slots (e.g. "Morning") pass
+  const minutes = parseInt(match[1], 10) * 60 + parseInt(match[2], 10);
+  return workingHours.some((wh) => {
+    const toMin = (t) => {
+      const m = /^(\d{1,2}):(\d{2})$/.exec(String(t || ''));
+      return m ? parseInt(m[1], 10) * 60 + parseInt(m[2], 10) : null;
+    };
+    const start = toMin(wh.start), end = toMin(wh.end);
+    return start !== null && end !== null && minutes >= start && minutes <= end;
+  });
+}
+
 function whatsappText(a) {
   return 'New Appointment Booking\n\n' +
     'Patient Name: ' + (a.name || 'Unknown') + '\n' +
@@ -48,6 +75,10 @@ function createConversation(opts) {
   const now = opts.now || (() => new Date());
   const maxAttempts = BotEngine.CONFIG.maxAttemptsPerQuestion;
   const maxPerSlot = opts.maxPerSlot || 0;           // 0 = no cap
+  // Read the booking back and wait for a "haan/sahi" before saving. On by
+  // default (the product requirement is "save only after confirmation"); pass
+  // confirmBeforeBooking:false to book the instant every slot is collected.
+  const confirmEnabled = opts.confirmBeforeBooking !== false;
 
   function endCall(speech) {
     return { twiml: BotEngine.wrapTwiml(BotEngine.say(speech) + BotEngine.hangup()), ended: true };
@@ -117,8 +148,106 @@ function createConversation(opts) {
         { status: 'Callback' });
     }
 
+    // --------------------------------------------- confirmation response
+    // We already read the booking back on a previous turn and are now waiting
+    // for a yes/no. The caller's answer is NOT new slot data, so we interpret
+    // it against the slots saved in the session, never the fresh extract().
+    let confirmed = false;
+    if (confirmEnabled && session.awaiting_confirm) {
+      const verdict = BotEngine.detectConfirm(input.transcript || '');
+      const booked = slotsFromSession(session);
+
+      if (verdict === 'no') {
+        // Re-ask date + time; keep name + reason so we don't re-hear them.
+        const reopened = Object.assign(booked, {
+          date: null, date_iso: null, date_speech: null,
+          time_slot: null, time_slot_display: null, time_slot_speech: null,
+        });
+        await store.saveSession(sessionWith(reopened, {
+          call_sid: callSid, phone: from, status: 'InProgress',
+          awaiting_confirm: false, completed: false,
+          attempt: 1, asked_field: 'date',
+          missing_count: 2, raw_text: slots.raw_text,
+        }));
+        return {
+          twiml: BotEngine.wrapTwiml(
+            BotEngine.gather('ठीक है, बताइए किस दिन और किस समय आना है?', actionUrl) +
+            BotEngine.say('कृपया बाद में कॉल कीजिए।')
+          ),
+          ended: false, status: 'InProgress', asked_field: 'date', attempt: 1,
+        };
+      }
+
+      if (verdict !== 'yes') {
+        // Unclear answer or noise: read the booking back again, keep waiting.
+        await store.saveSession(sessionWith(booked, {
+          call_sid: callSid, phone: from, status: 'InProgress',
+          awaiting_confirm: true, completed: false, raw_text: slots.raw_text,
+        }));
+        const prefix = slots.is_noise ? 'क्षमा कीजिए, साफ़ सुनाई नहीं दिया। ' : '';
+        return {
+          twiml: BotEngine.wrapTwiml(
+            BotEngine.gather(prefix + readbackSpeech(booked), actionUrl) +
+            BotEngine.say('कृपया बाद में कॉल कीजिए।')
+          ),
+          ended: false, status: 'InProgress', awaiting_confirm: true,
+        };
+      }
+
+      // verdict === 'yes' -> book the saved slots and fall through below.
+      confirmed = true;
+      session.awaiting_confirm = false;
+      Object.assign(slots, booked, {
+        all_collected: true, missing: [],
+        raw_text: ((session.raw_text || '') + ' ' + (slots.raw_text || '')).trim(),
+      });
+    }
+
     // -------------------------------------------------------- booking time
     if (slots.all_collected) {
+      // 0. doctor availability: working day + working hours + holidays
+      if (opts.doctorProvider) {
+        const doctor = await opts.doctorProvider();
+        if (doctor) {
+          const weekday = BotEngine.dayOfWeekFromDate(slots.date);
+          const holiday = (doctor.holidays || []).includes(slots.date_iso);
+          const hours = Array.isArray(doctor.working_hours) ? doctor.working_hours : [];
+          // Only the doctor's own hours for THIS weekday count.
+          const dayHours = weekday === null ? [] : hours.filter(h => Number(h.day) === weekday);
+          const hasSchedule = hours.length > 0;
+          const offThatDay = weekday !== null && hasSchedule && dayHours.length === 0;
+          const outsideHours = dayHours.length > 0 && !slotWithinHours(slots.time_slot, dayHours);
+          if (holiday || offThatDay || outsideHours) {
+            const clearDate = holiday || offThatDay;   // whole day gone -> ask for another day
+            const reopened = Object.assign({}, slots, {
+              date: clearDate ? null : slots.date,
+              date_iso: clearDate ? null : slots.date_iso,
+              date_speech: clearDate ? null : slots.date_speech,
+              time_slot: clearDate ? slots.time_slot : null,
+              time_slot_display: clearDate ? slots.time_slot_display : null,
+              time_slot_speech: clearDate ? slots.time_slot_speech : null,
+              hint: holiday ? 'closed_day' : 'doctor_off',
+            });
+            reopened.missing = BotEngine.computeMissing(reopened);
+            reopened.all_collected = false;
+            const field = BotEngine.nextField(reopened.missing);
+            const question = BotEngine.HINTS[reopened.hint] + BotEngine.questionFor(field, 1);
+            await store.saveSession(sessionWith(reopened, {
+              call_sid: callSid, phone: from, status: 'InProgress',
+              awaiting_confirm: false, attempt: 1, asked_field: field,
+              missing_count: reopened.missing.length, raw_text: slots.raw_text,
+            }));
+            return {
+              twiml: BotEngine.wrapTwiml(
+                BotEngine.gather(question, actionUrl) +
+                BotEngine.say('कृपया बाद में कॉल कीजिए।')
+              ),
+              ended: false, status: 'InProgress', asked_field: field, attempt: 1,
+            };
+          }
+        }
+      }
+
       // 1. same person, same slot -> never book twice
       const duplicate = await store.findDuplicate({ phone: from, date: slots.date, time_slot: slots.time_slot });
       if (duplicate) {
@@ -139,6 +268,24 @@ function createConversation(opts) {
           slots.missing = BotEngine.computeMissing(slots);
           slots.all_collected = false;
         }
+      }
+
+      // 3. read-back: everything is valid, so confirm before we save. This is
+      //    the FIRST time all slots are collected (session.awaiting_confirm is
+      //    still false and we did not come from a confirmed turn), so we hold
+      //    the booking and ask "Sahi hai?" instead of writing to the store.
+      if (slots.all_collected && confirmEnabled && !confirmed && !session.awaiting_confirm) {
+        await store.saveSession(sessionWith(slots, {
+          call_sid: callSid, phone: from, status: 'InProgress',
+          awaiting_confirm: true, completed: false, raw_text: slots.raw_text,
+        }));
+        return {
+          twiml: BotEngine.wrapTwiml(
+            BotEngine.gather(readbackSpeech(slots), actionUrl) +
+            BotEngine.say('कृपया बाद में कॉल कीजिए।')
+          ),
+          ended: false, status: 'InProgress', awaiting_confirm: true,
+        };
       }
     }
 

@@ -256,6 +256,12 @@ const BotEngine = (function () {
     return isNaN(dt.getTime()) ? null : dt;
   }
 
+  /** "24/06/2026" -> 0=Sunday..6=Saturday, or null when unparsable. */
+  function dayOfWeekFromDate(value) {
+    const dt = fromEnDate(value);
+    return dt ? dt.getDay() : null;
+  }
+
   function speechForDateValue(value) {
     const dt = fromEnDate(value);
     return dt ? fmtDate(dt).speech : null;
@@ -795,6 +801,38 @@ const BotEngine = (function () {
     return /naam nahi|नाम नहीं|naam galat|naam bhool/.test(t);
   }
 
+  // ------------------------------------------------------- YES / NO intent
+  // Used for the confirmation read-back ("Sahi hai?"). The earliest word in the
+  // sentence wins, so "nahi theek hai" counts as NO and "haan sahi hai" as YES.
+  const CONFIRM_YES = [
+    'haan', 'haanji', 'hanji', 'yes', 'yeah', 'yep', 'ok', 'okay', 'theek', 'thik',
+    'sahi', 'bilkul', 'correct', 'right', 'confirm', 'pakka', 'जी हाँ', 'जी हां', 'हाँ', 'हां',
+    'ठीक', 'सही', 'बिल्कुल',
+  ];
+  const CONFIRM_NO = [
+    'nahi', 'nahin', 'na', 'nope', 'galat', 'wrong', 'cancel', 'radd', 'mat',
+    'नहीं', 'गलत', 'रद्द', 'मत',
+  ];
+
+  /** Returns 'yes' | 'no' | null for a confirmation answer. */
+  function detectConfirm(text) {
+    const t = normalize(text).toLowerCase();
+    if (!t) return null;
+    let best = null;
+    const consider = (list, verdict) => {
+      for (const w of list) {
+        const latin = /^[a-z]/.test(w);
+        const idx = latin
+          ? (new RegExp('(?:^|\\s)' + w + '(?:\\s|$|[,.;।])')).exec(t)?.index ?? -1
+          : t.indexOf(w);
+        if (idx !== -1 && (best === null || idx < best.idx)) best = { idx, verdict };
+      }
+    };
+    consider(CONFIRM_YES, 'yes');
+    consider(CONFIRM_NO, 'no');
+    return best ? best.verdict : null;
+  }
+
   function computeMissing(out) {
     const missing = [];
     if (!out.name) missing.push({ field: 'name', hindi: 'आपका पूरा नाम' });
@@ -837,6 +875,7 @@ const BotEngine = (function () {
     invalid_time: 'समय समझ नहीं आया। ',
     slot_full: 'यह समय भर चुका है, कृपया दूसरा समय चुनिए। ',
     already_booked: 'इसी समय के लिए आपकी अपॉइंटमेंट पहले से बुक है। ',
+    doctor_off: 'डॉक्टर उस दिन उपलब्ध नहीं हैं। कृपया कोई और दिन बताइए। ',
   };
 
   function questionFor(field, attempt) {
@@ -868,7 +907,8 @@ const BotEngine = (function () {
     CONFIG, normalize, escapeXml, toNumber, cleanName, extractName, detectRelation,
     parseDate, parseTime, extractReason, isNoise, looksLikeDateAttempt, looksLikeTimeAttempt,
     extract, computeMissing, questionFor, nextField, HINTS, QUESTIONS,
-    fmtDate, fromEnDate, speechForDateValue, isoForDateValue, speechForSlot, finalize,
+    fmtDate, fromEnDate, dayOfWeekFromDate, speechForDateValue, isoForDateValue, speechForSlot, finalize,
+    detectConfirm, CONFIRM_YES, CONFIRM_NO,
     wrapTwiml, say, gather, hangup,
   };
 })();
