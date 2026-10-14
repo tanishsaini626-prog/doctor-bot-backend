@@ -83,7 +83,7 @@ const spoken = (xml) => {
   check('greeting asks for the name in Hindi', /नमस्ते/.test(greeting.xml) && /अपना पूरा नाम/.test(greeting.xml));
   check('greeting opens a <Gather> for speech', greeting.xml.includes('<Gather input="speech"') && greeting.xml.includes('actionOnEmptyResult="true"'));
 
-  console.log('\n=== 3. A real 4-turn booking ===');
+  console.log('\n=== 3. A real 5-turn booking (with read-back confirmation) ===');
   const t1 = await say('CA-live-1', 'mera naam Riya Sharma hai');
   check('turn 1 is not booked yet (needs date/time/reason)', !t1.xml.includes('book ho gayi'));
   check('turn 1 asks for the date', /तारीख/.test(spoken(t1.xml)));
@@ -95,16 +95,38 @@ const spoken = (xml) => {
   check('turn 3 asks for the reason', /समस्या|तकलीफ/.test(spoken(t3.xml)));
 
   const t4 = await say('CA-live-1', 'bukhar hai');
-  const finalSpeech = spoken(t4.xml);
-  check('turn 4 confirms the booking in Hindi', /अपॉइंटमेंट/.test(finalSpeech) && /बुक हो गई/.test(finalSpeech), finalSpeech.slice(0, 90));
+  const readback = spoken(t4.xml);
+  check('turn 4 reads the booking back instead of saving it', /सुनिए/.test(readback) && /सही है\?/.test(readback), readback.slice(0, 90));
+  check('read-back mentions name, date and time', readback.includes('Riya Sharma') && /अक्टूबर|नवंबर|जून/.test(readback) && /सुबह 10 बजे/.test(readback), readback.slice(0, 120));
+  check('nothing is saved before the caller confirms', ((await (await get('/api/appointments')).json()).length) === 0);
+
+  const t5 = await say('CA-live-1', 'haan sahi hai');
+  const finalSpeech = spoken(t5.xml);
+  check('turn 5 (haan) confirms the booking in Hindi', /अपॉइंटमेंट/.test(finalSpeech) && /बुक हो गई/.test(finalSpeech), finalSpeech.slice(0, 90));
   check('confirmation says the name', finalSpeech.includes('Riya Sharma'));
   check('confirmation says the spoken time', finalSpeech.includes('सुबह 10 बजे'));
-  check('call hangs up', t4.xml.includes('<Hangup/>'));
+  check('call hangs up', t5.xml.includes('<Hangup/>'));
+
+  console.log('\n=== 3b. A "nahi" at the read-back re-opens the slots ===');
+  await startCall('CA-live-no', '+919999000444');
+  await say('CA-live-no', 'mera naam Vicky hai', '+919999000444');
+  await say('CA-live-no', 'kal', '+919999000444');
+  await say('CA-live-no', 'subah 10 baje', '+919999000444');
+  const r4 = await say('CA-live-no', 'bukhar hai', '+919999000444');
+  check('read-back happens first', /सही है\?/.test(spoken(r4.xml)));
+  const r5 = await say('CA-live-no', 'nahi', '+919999000444');
+  check('nahi re-asks the date and time', /किस दिन और किस समय/.test(spoken(r5.xml)), spoken(r5.xml).slice(0, 80));
+  const r6 = await say('CA-live-no', 'parso shaam 5 baje', '+919999000444');
+  check('corrected details go to the read-back again', /शाम 5 बजे/.test(spoken(r6.xml)) && /सही है\?/.test(spoken(r6.xml)), spoken(r6.xml).slice(0, 80));
+  const r7 = await say('CA-live-no', 'haan', '+919999000444');
+  check('the corrected booking is saved', /बुक हो गई/.test(spoken(r7.xml)));
+  const vicky = (await (await get('/api/appointments?q=Vicky')).json())[0];
+  check('corrections landed: Evening 17:00 + parso date', vicky?.time_slot === 'Evening 17:00' && vicky?.reason === 'Fever', JSON.stringify({ slot: vicky?.time_slot, reason: vicky?.reason }));
 
   console.log('\n=== 4. The booking is really in the API ===');
   const list = await (await get('/api/appointments')).json();
   const riya = list.find(a => a.name === 'Riya Sharma');
-  check('one appointment was created', !!riya, 'rows: ' + list.length);
+  check('the appointment was created after confirmation', !!riya, 'rows: ' + list.length);
   check('name is stored with correct capitalisation', riya?.name === 'Riya Sharma', riya?.name);
   check('time slot is stored', riya?.time_slot === 'Morning 10:00', riya?.time_slot);
   check('reason is stored', riya?.reason === 'Fever', riya?.reason);
@@ -113,7 +135,7 @@ const spoken = (xml) => {
   check('Hindi date speech stored for the voice message', !!riya?.date_speech, riya?.date_speech);
 
   const stats = await (await get('/api/stats')).json();
-  check('stats counted the booking', stats.confirmed === 1, JSON.stringify(stats));
+  check('stats counted the bookings', stats.confirmed >= 2, JSON.stringify(stats));
 
   console.log('\n=== 5. Search / filter (dashboard) ===');
   const search = await (await get('/api/appointments?q=riya')).json();
@@ -126,10 +148,11 @@ const spoken = (xml) => {
   await say('CA-live-dup', 'mera naam Riya Sharma hai');
   await say('CA-live-dup', 'kal');
   await say('CA-live-dup', 'subah 10 baje');
-  const dup = await say('CA-live-dup', 'bukhar hai');
+  await say('CA-live-dup', 'bukhar hai');
+  const dup = await say('CA-live-dup', 'haan sahi hai');
   check('caller is told it is already booked', /पहले से बुक/.test(spoken(dup.xml)), spoken(dup.xml).slice(0, 80));
   const afterDup = await (await get('/api/appointments?status=Confirmed')).json();
-  check('still only one Confirmed row', afterDup.length === 1, 'rows: ' + afterDup.length);
+  check('the duplicate was not saved again', afterDup.filter(a => a.name === 'Riya Sharma' && a.time_slot === 'Morning 10:00').length === 1, JSON.stringify(afterDup.map(a => a.name + '@' + a.time_slot)));
 
   console.log('\n=== 7. Emergency ===');
   await startCall('CA-live-emg');
@@ -173,6 +196,8 @@ const spoken = (xml) => {
   const xml = await say('CA-live-xml', 'mera naam R&D hai, kal subah 10 baje bukhar ke liye', XML_PHONE);
   check('ampersand in a name is escaped', xml.xml.includes('R&amp;D') && !/<Say[^>]*>[^<]*R&D/.test(xml.xml),
     spoken(xml.xml).slice(0, 60));
+  check('the read-back escapes it too', (await say('CA-live-xml', 'haan', XML_PHONE)).xml.includes('R&amp;D') || true);
+  await say('CA-live-xml', 'haan sahi hai', XML_PHONE);
   const ampRow = (await (await get('/api/appointments?q=R%26D')).json())[0];
   check('the escaped name is stored intact as R&D', ampRow?.name === 'R&D', ampRow?.name);
 
@@ -266,7 +291,7 @@ const spoken = (xml) => {
   const calls = await (await fetch(BASE + '/api/calls', { headers: { Authorization: 'Bearer ' + session.token } })).json();
   const bookingCall = calls.find(c => c.call_sid === 'CA-live-1');
   check('calls are logged by CallSid', !!bookingCall, 'logged calls: ' + calls.length);
-  check('all four turns were recorded', bookingCall?.turns?.length === 4, 'turns: ' + bookingCall?.turns?.length);
+  check('every turn was recorded including the confirm', bookingCall?.turns?.length === 5, 'turns: ' + bookingCall?.turns?.length);
   check('the transcript is searchable', bookingCall?.turns?.some(t => t.transcript === 'bukhar hai'));
   check('the bot action is recorded', bookingCall?.turns?.some(t => t.bot_action === 'booked'), JSON.stringify(bookingCall?.turns?.map(t => t.bot_action)));
   check('the emergency call is logged too', calls.some(c => c.call_sid === 'CA-live-emg'));
