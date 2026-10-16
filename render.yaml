@@ -1,0 +1,34 @@
+# Render Blueprint - one-click backend deployment
+# In Render: New + -> Blueprint -> pick this repo -> Apply.
+# Then set the secret env vars in the dashboard (marked sync: false below).
+services:
+  - type: web
+    name: medibot-backend
+    runtime: node
+    plan: free
+    region: singapore                      # closest free region to India
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true                       # redeploy on every git push
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: STORE
+        value: auto                        # Mongo if MONGODB_URI works, else file-backed
+      # File store note: Render's free tier has an ephemeral disk, so the file
+      # store resets on every redeploy. Add a MONGODB_URI below for persistence.
+      - key: MONGODB_URI
+        sync: false                        # paste your Atlas URI in the dashboard (or leave empty)
+      - key: JWT_SECRET
+        generateValue: true                # Render creates a random secret
+      - key: ADMIN_EMAIL
+        sync: false                        # e.g. tanishsaini626@gmail.com
+      - key: ADMIN_PASSWORD
+        sync: false                        # choose something private
+      - key: TWILIO_VALIDATE_SIGNATURE
+        value: "true"                      # webhooks are public on Render; Twilio signs them
+      - key: TWILIO_AUTH_TOKEN
+        sync: false                        # needed for signature validation
+      - key: MAX_PER_SLOT
+        value: "0"
