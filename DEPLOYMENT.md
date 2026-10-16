@@ -1,5 +1,32 @@
 # MediBot — Deployment Guide (Phase E)
 
+## 0. What is already live
+
+- **Frontend**: https://doctor-bot-frontend.vercel.app — deployed via the Vercel
+  CLI, SPA rewrites in `vercel.json`, and `VITE_API_URL` baked into the bundle as
+  `https://medibot-backend.onrender.com`.
+- **Backend**: one-click via the committed `render.yaml` blueprint (section 0.1).
+
+### 0.1 Render backend (one-click blueprint)
+
+1. Go to https://dashboard.render.com/select-repo → **New → Blueprint** → pick
+   `doctor-bot-backend`.
+2. Render reads `render.yaml`: free Node service, health check `/api/health`,
+   auto-deploy on every push, `JWT_SECRET` auto-generated.
+3. Fill the secret values it asks for: `ADMIN_EMAIL`, `ADMIN_PASSWORD`,
+   `TWILIO_AUTH_TOKEN` (needed for signature validation), and `MONGODB_URI`
+   (optional — without it the file-backed store runs, but its data resets on
+   every redeploy because Render's free disk is ephemeral).
+4. Deploy. The service answers at `https://medibot-backend.onrender.com` — the
+   exact URL already baked into the frontend bundle.
+5. Free-tier notes: the service sleeps after ~15 min idle (the first call takes
+   ~50 s to wake it), and Twilio requires credit before any real call.
+6. Then point the Twilio number's webhook to
+   `https://medibot-backend.onrender.com/webhook/doctor-bot` and the status
+   callback to `https://medibot-backend.onrender.com/webhook/status`.
+
+---
+
 Target: deploy the **backend** to a free Node host (Render / Railway / Fly) and the
 **frontend** to Vercel/Netlify, with a **MongoDB Atlas** free-tier cluster for
 persistence. Nothing here requires Twilio credits — the voice flow is tested with
