@@ -45,7 +45,7 @@ function assertEnv(name) {
 }
 
 const PORT = assertEnv('PORT') || 5000;
-const MONGODB_URI = assertEnv('MONGODB_URI');   // fail fast if missing in production
+const MONGODB_URI = process.env.MONGODB_URI || '';   // optional; required only when STORE=mongo
 const MAX_PER_SLOT = parseInt(process.env.MAX_PER_SLOT || '0', 10);   // 0 = unlimited
 const STORE_MODE = (process.env.STORE || 'auto').toLowerCase();       // auto | mongo | file | memory
 // Where the file-backed store keeps its JSON (ignored by git via .data/).
