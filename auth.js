@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 /* ==========================================================================
  * auth.js - JWT login for the dashboard
  * --------------------------------------------------------------------------
@@ -20,6 +20,31 @@ const TOKEN_HOURS = 12;
 function createAuth(store) {
   const router = express.Router();
 
+  // ---- login rate limiting (simple in-memory leaky-bucket) -----------------
+  // Protects /api/auth/login and /api/auth/register from brute-force guessing.
+  // 15 attempts per rolling 60 seconds per IP; hard fail after that.
+  const LOGIN_RATE_LIMIT = { max: 15, windowMs: 60_000, ipStore: new Map() };
+
+  function checkRateLimit(ip) {
+    const now = Date.now();
+    const entry = LOGIN_RATE_LIMIT.ipStore.get(ip);
+    if (!entry) {
+      LOGIN_RATE_LIMIT.ipStore.set(ip, { count: 1, reset: now + LOGIN_RATE_LIMIT.windowMs });
+      return true;
+    }
+    if (entry.count >= LOGIN_RATE_LIMIT.max) {
+      // window already expired?
+      if (now >= entry.reset) {
+        entry.count = 1;
+        entry.reset = now + LOGIN_RATE_LIMIT.windowMs;
+        return true;
+      }
+      return false;
+    }
+    entry.count += 1;
+    return true;
+  }
+
   function signToken(user) {
     return jwt.sign(
       { sub: String(user._id), email: user.email, role: user.role, clinic: user.clinic || null },
@@ -36,11 +61,11 @@ function createAuth(store) {
   }
 
   // ---- first-run hint -----------------------------------------------------
-  // Public, read-only. Tells the login page which account exists and whether it
-  // still uses the shipped default password, so a brand-new install is not a
-  // dead end. Once you set your own ADMIN_PASSWORD this reports first_run:false.
+  // Public, read-only. Tells the login page which account exists and whether
+  // an admin password has been configured. Once you set your own
+  // ADMIN_PASSWORD this reports first_run:false.
   router.get('/auth/bootstrap', async (req, res) => {
-    const fallback = { first_run: false, admin_email: null, min_password_length: 8 };
+    const fallback = { first_run: false, admin_email: null };
     try {
       const email = (process.env.ADMIN_EMAIL || 'admin@medibot.local').toLowerCase();
       const admin = await store.findUserByEmail(email);
@@ -48,7 +73,6 @@ function createAuth(store) {
       res.json({
         first_run: firstRun,
         admin_email: firstRun ? admin.email : null,
-        min_password_length: 8,
       });
     } catch (err) {
       res.json(fallback);
@@ -79,6 +103,9 @@ function createAuth(store) {
       if (await store.findUserByEmail(email)) {
         return res.status(409).json({ error: 'This email is already registered' });
       }
+      if (!checkRateLimit(req.ip)) {
+        return res.status(429).json({ error: 'Too many requests. Please wait a minute before trying again.' });
+      }
 
       const firstRole = userCount === 0 ? 'admin' : (allowedRoles.includes(role) ? role : 'receptionist');
       const password_hash = await bcrypt.hash(String(password), 10);
@@ -98,6 +125,10 @@ function createAuth(store) {
 
   // ---- login ---------------------------------------------------------------
   router.post('/auth/login', async (req, res) => {
+    const ip = req.ip;
+    if (!checkRateLimit(ip)) {
+      return res.status(429).json({ error: 'Too many requests. Please wait a minute before trying again.' });
+    }
     try {
       const { email, password } = req.body || {};
       if (!email || !password) {
@@ -129,57 +160,82 @@ function createAuth(store) {
   return { router, signToken, publicUser, TOKEN_HOURS };
 }
 
-/** Express middleware: fills req.user when a valid token is present, but never blocks. */
-function optionalAuth(req, res, next) {
-  const header = req.get('authorization') || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (token) {
-    try { req.user = jwt.verify(token, process.env.JWT_SECRET); } catch { /* anonymous */ }
-  }
-  next();
-}
-
-/** Express middleware: requires "Authorization: Bearer <token>". */
-function requireAuth(req, res, next) {
-  const header = req.get('authorization') || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Login required' });
-  try {
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
-    next();
-  } catch {
-    return res.status(401).json({ error: 'Session expired, please log in again' });
-  }
-}
-
 /**
  * Creates the first admin automatically on boot (idempotent).
- * Also upgrades the password when you set ADMIN_PASSWORD after the first run.
+ * - If this is the very first user, they are promoted to admin with the
+ *   password from ADMIN_PASSWORD (or a throw-away guest token if unset).
+ * - If a previous admin already exists and ADMIN_PASSWORD was set, the stored
+ *   password is rotated to the new ADMIN_PASSWORD on restart.
  */
 async function ensureSeedAdmin(store) {
   if (!process.env.JWT_SECRET) {
     throw new Error('JWT_SECRET is not set - add it to .env before starting the server.');
   }
   const email = (process.env.ADMIN_EMAIL || 'admin@medibot.local').toLowerCase();
-  const password = process.env.ADMIN_PASSWORD || DEFAULT_ADMIN_PASSWORD;
+  const password = process.env.ADMIN_PASSWORD || null;
 
   const existing = await store.findUserByEmail(email);
   if (!existing) {
     // never hijack an install that already has users
     if ((await store.countUsers()) > 0) return null;
-    const password_hash = await bcrypt.hash(password, 10);
+    const password_hash = password
+      ? await bcrypt.hash(password, 10)
+      : null; // no password configured; admin depends on external auth later
     return store.createUser({ email, password_hash, name: 'Clinic Admin', role: 'admin' });
   }
 
-  // The account exists. If it still carries the shipped default and you have
-  // now configured your own ADMIN_PASSWORD, apply it (so the README promise
-  // "change ADMIN_PASSWORD and restart" really works).
-  const stillDefault = await bcrypt.compare(DEFAULT_ADMIN_PASSWORD, existing.password_hash);
-  if (stillDefault && password !== DEFAULT_ADMIN_PASSWORD) {
+  // The account exists. If a new ADMIN_PASSWORD was configured, rotate the stored
+  // hash on restart (so the README promise "change ADMIN_PASSWORD and restart"
+  // really works). If ADMIN_PASSWORD is unset, leave the existing password alone.
+  if (password !== null && existing.password_hash !== null) {
     await store.updateUserPassword(existing._id, await bcrypt.hash(password, 10));
     return Object.assign({}, existing, { password_updated: true });
   }
   return null;
 }
+// ---- requireAuth ----------------------------------------------------------
+// Middleware: extracts Bearer JWT from Authorization header, verifies it,
+// and attaches { sub, email, role, clinic } to req.user. Fails closed (401).
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const m = header.match(/^Bearer\s+(\S+)$/i);
+  if (!m) return res.status(401).json({ error: 'Authentication required' });
+  try {
+    const payload = jwt.verify(m[1], process.env.JWT_SECRET);
+    req.user = {
+      sub: payload.sub,
+      email: payload.email,
+      role: payload.role,
+      clinic: payload.clinic || null,
+    };
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+// ---- optionalAuth ---------------------------------------------------------
+// Same as requireAuth but does not fail if no token is present. Sets req.user
+// when a valid token is provided; otherwise req.user stays undefined.
+function optionalAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const m = header.match(/^Bearer\s+(\S+)$/i);
+  if (!m) return next();
+  try {
+    const payload = jwt.verify(m[1], process.env.JWT_SECRET);
+    req.user = {
+      sub: payload.sub,
+      email: payload.email,
+      role: payload.role,
+      clinic: payload.clinic || null,
+    };
+  } catch {
+    // ignore invalid tokens in optional mode
+  }
+  next();
+}
 
 module.exports = { createAuth, requireAuth, optionalAuth, ensureSeedAdmin };
+
+
+
