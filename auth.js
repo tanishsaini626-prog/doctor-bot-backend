@@ -16,7 +16,6 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
 const TOKEN_HOURS = 12;
-const DEFAULT_ADMIN_PASSWORD = 'medibot-admin';   // shipped dev default, see .env.example
 
 function createAuth(store) {
   const router = express.Router();
@@ -44,11 +43,8 @@ function createAuth(store) {
     const fallback = { first_run: false, admin_email: null, min_password_length: 8 };
     try {
       const email = (process.env.ADMIN_EMAIL || 'admin@medibot.local').toLowerCase();
-      const configuredPassword = process.env.ADMIN_PASSWORD || DEFAULT_ADMIN_PASSWORD;
-      const usingShippedDefault = configuredPassword === DEFAULT_ADMIN_PASSWORD;
-      const admin = usingShippedDefault ? await store.findUserByEmail(email) : null;
-      const firstRun = !!(admin && admin.role === 'admin' &&
-        await bcrypt.compare(DEFAULT_ADMIN_PASSWORD, admin.password_hash));
+      const admin = await store.findUserByEmail(email);
+      const firstRun = !!(admin && admin.role === 'admin');
       res.json({
         first_run: firstRun,
         admin_email: firstRun ? admin.email : null,

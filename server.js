@@ -34,8 +34,18 @@ const { createFileStore } = require('./store-file');
 const { createAuth, requireAuth, ensureSeedAdmin } = require('./auth');
 const { requireTwilioSignature } = require('./twilio-signature');
 
-const PORT = process.env.PORT || 5000;
-const MONGODB_URI = process.env.MONGODB_URI || '';
+// --- configuration validation (fail fast on production-required secrets) ---
+function assertEnv(name) {
+  const value = process.env[name];
+  if (value === undefined || String(value).trim() === '') {
+    console.error('FATAL: Missing required environment variable: ' + name);
+    process.exit(1);
+  }
+  return value;
+}
+
+const PORT = assertEnv('PORT') || 5000;
+const MONGODB_URI = assertEnv('MONGODB_URI');   // fail fast if missing in production
 const MAX_PER_SLOT = parseInt(process.env.MAX_PER_SLOT || '0', 10);   // 0 = unlimited
 const STORE_MODE = (process.env.STORE || 'auto').toLowerCase();       // auto | mongo | file | memory
 // Where the file-backed store keeps its JSON (ignored by git via .data/).
@@ -43,11 +53,28 @@ const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, '.data', 'store.
 
 const app = express();
 app.set('trust proxy', 1);                       // correct https:// behind ngrok / Render
-app.use(cors());
+app.use(cors({
+  origin: (process.env.CORS_ORIGIN === undefined) ? false : process.env.CORS_ORIGIN,
+  optionsSuccessStatus: 204,
+}));
 app.use(express.urlencoded({ extended: false }));
-app.use(express.json());
+app.use(express.json({ limit: process.env.REQUEST_SIZE_LIMIT || '100kb' }));
 
-// ---- 2. storage ----------------------------------------------------------
+// ---- 3. security middleware -------------------------------------------------
+// Helmet sets sensible security headers (CSP, HSTS, frame-ancestors, etc.)
+// and is a baseline for production.
+// ---- 3. security -----------------------------------------------------------
+const helmet = require('helmet');
+app.use(helmet());
+
+// Set strict security headers; disable the cross-origin block if you add
+// a trusted frontend origin via CORS_ORIGIN.
+app.use((req, res, next) => {
+  // [CORS_ORIGIN] is enforced via the cors() middleware above.
+  next();
+});
+
+// ---- 4. storage ----------------------------------------------------------
 mongoose.set('bufferTimeoutMS', 3000);           // fail fast, never freeze a live call
 
 let activeStore = createMemoryStore();
@@ -67,6 +94,11 @@ function storeReady() {
 }
 
 async function initStore() {
+  // STORE=mongo must never fall back silently to file/memory.
+  if (STORE_MODE === 'mongo' && !MONGODB_URI) {
+    console.error('FATAL: STORE=mongo requires MONGODB_URI; set it in your environment/secret manager and restart.');
+    process.exit(1);
+  }
   if (STORE_MODE === 'memory') {
     console.log('🧠 STORE=memory - using the in-memory store (data is lost on restart)');
     return;

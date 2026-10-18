@@ -8,7 +8,8 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "test": "node --test",
-    "test:live": "node scripts/live-check.js"
+    "test:live": "node scripts/live-check.js",
+    "demo": "node scripts/demo-call.js"
   },
   "keywords": [
     "twilio",
@@ -26,5 +27,8 @@
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^8.24.5",
     "twilio": "^6.0.2"
+  },
+  "devDependencies": {
+    "helmet": "^8.3.0"
   }
 }
