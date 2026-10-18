@@ -53,8 +53,15 @@ const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, '.data', 'store.
 
 const app = express();
 app.set('trust proxy', 1);                       // correct https:// behind ngrok / Render
+const CORS_ORIGIN_RAW = process.env.CORS_ORIGIN || '';
+const CORS_ORIGINS = CORS_ORIGIN_RAW.split(',').map(s => s.trim()).filter(Boolean);
+
 app.use(cors({
-  origin: (process.env.CORS_ORIGIN === undefined) ? false : process.env.CORS_ORIGIN,
+  origin: CORS_ORIGINS.length === 0
+    ? false
+    : CORS_ORIGINS.includes('*')
+      ? true
+      : (origin) => origin && CORS_ORIGINS.includes(origin),
   optionsSuccessStatus: 204,
 }));
 app.use(express.urlencoded({ extended: false }));

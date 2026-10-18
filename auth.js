@@ -1,4 +1,4 @@
-﻿'use strict';
+'use strict';
 /* ==========================================================================
  * auth.js - JWT login for the dashboard
  * --------------------------------------------------------------------------
@@ -14,6 +14,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 
 const TOKEN_HOURS = 12;
 
@@ -45,12 +46,58 @@ function createAuth(store) {
     return true;
   }
 
+  // ---- per-account lockout -------------------------------------------------
+  const LOCKOUT_MAX_ATTEMPTS = parseInt(process.env.LOCKOUT_MAX_ATTEMPTS || '5', 10);
+  const LOCKOUT_WINDOW_MS = parseInt(process.env.LOCKOUT_WINDOW_MS || '900000', 10); // 15 minutes
+  const FAILED_LOGIN_STORE = new Map(); // email -> { count, lockedUntil }
+
+  function isAccountLocked(email) {
+    const entry = FAILED_LOGIN_STORE.get(email);
+    if (!entry) return false;
+    const now = Date.now();
+    if (now >= entry.lockedUntil) {
+      FAILED_LOGIN_STORE.delete(email);
+      return false;
+    }
+    return true;
+  }
+
+  function recordFailedLogin(email) {
+    const now = Date.now();
+    const entry = FAILED_LOGIN_STORE.get(email) || { count: 0, lockedUntil: 0 };
+    entry.count += 1;
+    if (entry.count >= LOCKOUT_MAX_ATTEMPTS) {
+      entry.lockedUntil = now + LOCKOUT_WINDOW_MS;
+    }
+    FAILED_LOGIN_STORE.set(email, entry);
+  }
+
+  function resetFailedLogin(email) {
+    FAILED_LOGIN_STORE.delete(email);
+  }
+
+  // ---- token blocklist (for logout / revocation) ---------------------------
+  const TOKEN_BLOCKLIST = new Set(); // jti values
+
+  function blockToken(jti) {
+    if (!jti) return;
+    TOKEN_BLOCKLIST.add(jti);
+    // auto-cleanup after token expiry (12h)
+    setTimeout(() => TOKEN_BLOCKLIST.delete(jti), TOKEN_HOURS * 60 * 60 * 1000);
+  }
+
+  function isTokenBlocked(jti) {
+    return jti && TOKEN_BLOCKLIST.has(jti);
+  }
+
   function signToken(user) {
-    return jwt.sign(
-      { sub: String(user._id), email: user.email, role: user.role, clinic: user.clinic || null },
+    const jti = crypto.randomBytes(16).toString('hex');
+    const token = jwt.sign(
+      { sub: String(user._id), email: user.email, role: user.role, clinic: user.clinic || null, jti },
       process.env.JWT_SECRET,
       { expiresIn: `${TOKEN_HOURS}h` }
     );
+    return { token, jti };
   }
 
   function publicUser(user) {
@@ -116,7 +163,8 @@ function createAuth(store) {
         role: firstRole,
       });
 
-      res.status(201).json({ token: signToken(user), user: publicUser(user) });
+      const { token } = signToken(user);
+      res.status(201).json({ token, user: publicUser(user) });
     } catch (err) {
       console.error('register failed:', err.message);
       res.status(500).json({ error: 'Registration failed' });
@@ -134,16 +182,43 @@ function createAuth(store) {
       if (!email || !password) {
         return res.status(400).json({ error: 'Email and password are required' });
       }
-      const user = await store.findUserByEmail(String(email).toLowerCase().trim());
+      const normalizedEmail = String(email).toLowerCase().trim();
+
+      // Per-account lockout: reject before any DB lookup if the account is locked
+      if (isAccountLocked(normalizedEmail)) {
+        return res.status(423).json({ error: 'Account temporarily locked due to multiple failed login attempts. Please try again later.' });
+      }
+
+      const user = await store.findUserByEmail(normalizedEmail);
       // same error for unknown email and wrong password (no account guessing)
       if (!user || !user.active || !(await bcrypt.compare(String(password), user.password_hash))) {
+        recordFailedLogin(normalizedEmail);
         return res.status(401).json({ error: 'Invalid email or password' });
       }
-      res.json({ token: signToken(user), user: publicUser(user) });
+
+      resetFailedLogin(normalizedEmail);
+      const { token } = signToken(user);
+      res.json({ token, user: publicUser(user) });
     } catch (err) {
       console.error('login failed:', err.message);
       res.status(500).json({ error: 'Login failed' });
     }
+  });
+
+  // ---- logout --------------------------------------------------------------
+  // Revokes the current bearer token by adding its jti to the blocklist.
+  router.post('/auth/logout', optionalAuth, async (req, res) => {
+    const header = req.headers.authorization || '';
+    const m = header.match(/^Bearer\s+(\S+)$/i);
+    if (m) {
+      try {
+        const payload = jwt.verify(m[1], process.env.JWT_SECRET);
+        if (payload.jti) blockToken(payload.jti);
+      } catch {
+        // token invalid or already expired - nothing to revoke
+      }
+    }
+    res.json({ ok: true });
   });
 
   // ---- who am I ------------------------------------------------------------
@@ -202,6 +277,9 @@ function requireAuth(req, res, next) {
   if (!m) return res.status(401).json({ error: 'Authentication required' });
   try {
     const payload = jwt.verify(m[1], process.env.JWT_SECRET);
+    if (isTokenBlocked(payload.jti)) {
+      return res.status(401).json({ error: 'Token has been revoked' });
+    }
     req.user = {
       sub: payload.sub,
       email: payload.email,
@@ -223,6 +301,9 @@ function optionalAuth(req, res, next) {
   if (!m) return next();
   try {
     const payload = jwt.verify(m[1], process.env.JWT_SECRET);
+    if (isTokenBlocked(payload.jti)) {
+      return; // do not attach a revoked token's user
+    }
     req.user = {
       sub: payload.sub,
       email: payload.email,
@@ -236,6 +317,8 @@ function optionalAuth(req, res, next) {
 }
 
 module.exports = { createAuth, requireAuth, optionalAuth, ensureSeedAdmin };
+
+
 
 
 
