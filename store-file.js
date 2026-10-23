@@ -23,7 +23,7 @@ const { createMemoryStore } = require('./store-memory');
 
 // Methods that change state and therefore must trigger a flush to disk.
 const MUTATING = new Set([
-  'saveSession', 'clearSession', 'createAppointment', 'updateAppointmentStatus',
+  'saveSession', 'clearSession', 'createAppointment', 'updateAppointmentStatus', 'deleteAppointment',
   'createUser', 'updateUserPassword', 'logCallTurn',
   'createDoctor', 'updateDoctor', 'deleteDoctor', 'saveClinic', 'createLead',
 ]);

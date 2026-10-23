@@ -173,6 +173,11 @@ function createMongoStore() {
       return Appointment.findByIdAndUpdate(id, { $set: { status } }, { new: true }).lean();
     },
 
+    async deleteAppointment(id) {
+      const removed = await Appointment.findByIdAndDelete(id);
+      return !!removed;
+    },
+
     async stats() {
       const [total, confirmed, incomplete, emergency, abandoned, today] = await Promise.all([
         Appointment.countDocuments({}),

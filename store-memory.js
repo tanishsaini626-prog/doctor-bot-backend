@@ -242,6 +242,13 @@ function createMemoryStore(options) {
       return clone(doc);
     },
 
+    async deleteAppointment(apptId) {
+      const idx = appointments.findIndex(a => a._id === apptId);
+      if (idx === -1) return false;
+      appointments.splice(idx, 1);
+      return true;
+    },
+
     async stats() {
       const count = (s) => appointments.filter(a => a.status === s).length;
       const today = new Date().toLocaleDateString('en-IN');

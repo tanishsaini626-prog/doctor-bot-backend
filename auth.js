@@ -18,7 +18,21 @@ const crypto = require('crypto');
 
 const TOKEN_HOURS = 12;
 
-function createAuth(store) {
+// ---- token blocklist (for logout / revocation) ---------------------------
+const TOKEN_BLOCKLIST = new Set(); // jti values
+
+function blockToken(jti) {
+  if (!jti) return;
+  TOKEN_BLOCKLIST.add(jti);
+  // auto-cleanup after token expiry (12h)
+  setTimeout(() => TOKEN_BLOCKLIST.delete(jti), TOKEN_HOURS * 60 * 60 * 1000);
+}
+
+function isTokenBlocked(jti) {
+  return jti && TOKEN_BLOCKLIST.has(jti);
+}
+
+function createAuth(store, requireStoreReady) {
   const router = express.Router();
 
   // ---- login rate limiting (simple in-memory leaky-bucket) -----------------
@@ -74,20 +88,6 @@ function createAuth(store) {
 
   function resetFailedLogin(email) {
     FAILED_LOGIN_STORE.delete(email);
-  }
-
-  // ---- token blocklist (for logout / revocation) ---------------------------
-  const TOKEN_BLOCKLIST = new Set(); // jti values
-
-  function blockToken(jti) {
-    if (!jti) return;
-    TOKEN_BLOCKLIST.add(jti);
-    // auto-cleanup after token expiry (12h)
-    setTimeout(() => TOKEN_BLOCKLIST.delete(jti), TOKEN_HOURS * 60 * 60 * 1000);
-  }
-
-  function isTokenBlocked(jti) {
-    return jti && TOKEN_BLOCKLIST.has(jti);
   }
 
   function signToken(user) {
@@ -172,7 +172,9 @@ function createAuth(store) {
   });
 
   // ---- login ---------------------------------------------------------------
-  router.post('/auth/login', async (req, res) => {
+  // 503 until the store is initialized (initStore + ensureSeedAdmin complete).
+  const loginMiddleware = requireStoreReady || ((_req, _res, next) => next());
+  router.post('/auth/login', loginMiddleware, async (req, res) => {
     const ip = req.ip;
     if (!checkRateLimit(ip)) {
       return res.status(429).json({ error: 'Too many requests. Please wait a minute before trying again.' });

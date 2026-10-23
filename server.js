@@ -87,7 +87,7 @@ mongoose.set('bufferTimeoutMS', 3000);           // fail fast, never freeze a li
 let activeStore = createMemoryStore();
 let storeKind = 'memory';
 const DELEGATED = ['getSession', 'saveSession', 'clearSession', 'findDuplicate', 'countBooked',
-  'createAppointment', 'listAppointments', 'getAppointment', 'updateAppointmentStatus', 'stats',
+  'createAppointment', 'listAppointments', 'getAppointment', 'updateAppointmentStatus', 'deleteAppointment', 'stats',
   'countUsers', 'findUserByEmail', 'createUser', 'updateUserPassword', 'logCallTurn', 'listCallLogs',
   'listDoctors', 'createDoctor', 'updateDoctor', 'deleteDoctor', 'getClinic', 'saveClinic',
   'createLead', 'listLeads'];
@@ -96,8 +96,35 @@ for (const method of DELEGATED) {
   store[method] = (...args) => activeStore[method](...args);
 }
 
-function storeReady() {
-  return storeKind === 'memory' || storeKind === 'file' || mongoose.connection.readyState === 1;
+// ---- store-readiness gate --------------------------------------------------
+// login/appointment endpoints return 503 until initStore() + ensureSeedAdmin()
+// have completed. Prevents requests from hitting a store that isn't ready yet.
+let storeInitialized = false;
+const storeReadyPromise = (async () => {
+  await initStore();
+  try {
+    const seeded = await ensureSeedAdmin(store);
+    if (seeded && seeded.password_updated) {
+      console.log('🔑 Admin password updated from ADMIN_PASSWORD in .env for', seeded.email);
+    } else if (seeded) {
+      console.log('👤 Created the first admin account:', seeded.email);
+      if (!process.env.ADMIN_PASSWORD) {
+        console.log('   Default password: medibot-admin  ->  change it by setting ADMIN_PASSWORD in .env and restarting.');
+      }
+    }
+  } catch (err) {
+    console.error('⚠️  Could not prepare the admin account:', err.message);
+  }
+  storeInitialized = true;
+})();
+
+function requireStoreReady(req, res, next) {
+  if (!storeInitialized) {
+    return res.status(503).json({
+      error: 'Service temporarily unavailable: store is initializing. Please retry.'
+    });
+  }
+  next();
 }
 
 async function initStore() {
@@ -167,26 +194,13 @@ const bot = createConversation({
   confirmBeforeBooking: CONFIRM_BEFORE_BOOKING,
   doctorProvider,
 });
-const { router: authRouter } = createAuth(store);
+const { router: authRouter } = createAuth(store, requireStoreReady);
 
 // ---- 2b. admin account ---------------------------------------------------
 // JWT_SECRET is required in .env (generate one, never commit it). The first
 // admin is created automatically so a fresh install can log in immediately.
-initStore().then(async () => {
-  try {
-    const seeded = await ensureSeedAdmin(store);
-    if (seeded && seeded.password_updated) {
-      console.log('🔑 Admin password updated from ADMIN_PASSWORD in .env for', seeded.email);
-    } else if (seeded) {
-      console.log('👤 Created the first admin account:', seeded.email);
-      if (!process.env.ADMIN_PASSWORD) {
-        console.log('   Default password: medibot-admin  ->  change it by setting ADMIN_PASSWORD in .env and restarting.');
-      }
-    }
-  } catch (err) {
-    console.error('⚠️  Could not prepare the admin account:', err.message);
-  }
-});
+// initStore() + ensureSeedAdmin() run via storeReadyPromise (above); once
+// storeInitialized is true, login/appointment routes stop returning 503.
 
 // ---- 3. WhatsApp notification to the clinic (optional) -------------------
 let twilioClient = null;
@@ -399,6 +413,8 @@ app.post('/webhook/status', twilioSignature, async (req, res) => {
 
 // Dashboard APIs are private (Bearer JWT from /api/auth/login)
 const private_api = requireAuth;
+// Gate all appointment endpoints until the store is initialized.
+app.use('/api/appointments', requireStoreReady);
 
 app.get('/api/appointments', private_api, async (req, res) => {
   try {
@@ -414,6 +430,21 @@ app.get('/api/appointments', private_api, async (req, res) => {
     res.status(500).json({ error: 'Could not load appointments' });
   }
 });
+
+// Pre-check for duplicate before booking (returns whether a clash exists).
+app.get('/api/appointments/check-duplicate', private_api, async (req, res) => {
+  const { phone, date, time_slot } = req.query;
+  if (!phone || !date || !time_slot) {
+    return res.status(400).json({ error: 'phone, date, and time_slot query parameters are required' });
+  }
+  try {
+    const existing = await store.findDuplicate({ phone, date, time_slot });
+    res.json({ duplicate: !!existing, appointment: existing || null });
+  } catch (err) {
+    res.status(500).json({ error: 'Duplicate check failed' });
+  }
+});
+
 
 app.get('/api/appointments/:id', private_api, async (req, res) => {
   try {
@@ -435,6 +466,72 @@ app.patch('/api/appointments/:id', private_api, async (req, res) => {
     const updated = await store.updateAppointmentStatus(req.params.id, status);
     if (!updated) return res.status(404).json({ error: 'Not found' });
     res.json(updated);
+  } catch (err) {
+    res.status(400).json({ error: 'Invalid id' });
+  }
+});
+
+// ---- manual appointment creation (dashboard use case) --------------------
+app.post('/api/appointments', private_api, async (req, res) => {
+  const body = req.body || {};
+  const { name, phone, date, time_slot, reason, booking_for, status } = body;
+
+  if (!name || !String(name).trim()) {
+    return res.status(400).json({ error: 'Patient name is required' });
+  }
+  if (!phone || !String(phone).trim()) {
+    return res.status(400).json({ error: 'Phone number is required' });
+  }
+  if (!date || !String(date).trim()) {
+    return res.status(400).json({ error: 'Appointment date is required' });
+  }
+  if (!time_slot || !String(time_slot).trim()) {
+    return res.status(400).json({ error: 'Time slot is required' });
+  }
+
+  // Duplicate check: same phone + same date + same slot must not exist.
+  const existing = await store.findDuplicate({ phone, date, time_slot });
+  if (existing) {
+    return res.status(409).json({
+      error: 'An appointment already exists for this phone, date, and time slot',
+      appointment: existing,
+    });
+  }
+
+  // Slot cap (optional): prevent overbooking.
+  if (MAX_PER_SLOT > 0) {
+    const booked = await store.countBooked({ date, time_slot });
+    if (booked >= MAX_PER_SLOT) {
+      return res.status(409).json({ error: 'This time slot is already full' });
+    }
+  }
+
+  try {
+    const appointment = await store.createAppointment({
+      name: String(name).trim(),
+      phone: String(phone).trim(),
+      date: String(date).trim(),
+      time_slot: String(time_slot).trim(),
+      time_slot_display: String(time_slot).trim(),
+      reason: reason ? String(reason).trim() : 'Not specified',
+      booking_for: booking_for || 'Self',
+      status: status || 'Confirmed',
+      priority: 'Normal',
+      source: 'dashboard',
+    });
+    res.status(201).json(appointment);
+  } catch (err) {
+    console.error('Create appointment failed:', err.message);
+    res.status(500).json({ error: 'Could not create appointment' });
+  }
+});
+
+// Delete an appointment.
+app.delete('/api/appointments/:id', private_api, async (req, res) => {
+  try {
+    const removed = await store.deleteAppointment(req.params.id);
+    if (!removed) return res.status(404).json({ error: 'Not found' });
+    res.json({ deleted: true });
   } catch (err) {
     res.status(400).json({ error: 'Invalid id' });
   }
