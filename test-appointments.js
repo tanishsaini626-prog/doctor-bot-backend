@@ -166,7 +166,7 @@ test('POST /api/appointments creates a new appointment (201)', async () => {
   const r = await request('POST', '/api/appointments', {
     name: 'Ramesh Kumar',
     phone: '+91 98765 43210',
-    date: '25/06/2026',
+    date: '25/12/2026',
     time_slot: 'Morning 10:00',
     reason: 'Fever',
     booking_for: 'Self',
@@ -174,7 +174,7 @@ test('POST /api/appointments creates a new appointment (201)', async () => {
   assert.equal(r.status, 201);
   assert.equal(r.json.name, 'Ramesh Kumar');
   assert.equal(r.json.phone, '+91 98765 43210');
-  assert.equal(r.json.date, '25/06/2026');
+  assert.equal(r.json.date, '25/12/2026');
   assert.equal(r.json.time_slot, 'Morning 10:00');
   assert.equal(r.json.reason, 'Fever');
   assert.equal(r.json.status, 'Confirmed');
@@ -184,7 +184,7 @@ test('POST /api/appointments creates a new appointment (201)', async () => {
 test('POST /api/appointments rejects missing required fields (400)', async () => {
   const r = await request('POST', '/api/appointments', {
     phone: '+91 98765 43210',
-    date: '25/06/2026',
+    date: '25/12/2026',
     time_slot: 'Morning 10:00',
   });
   assert.equal(r.status, 400);
@@ -195,7 +195,7 @@ test('POST /api/appointments rejects duplicate phone+date+slot (409)', async () 
   const r = await request('POST', '/api/appointments', {
     name: 'Ramesh Kumar',
     phone: '+91 98765 43210',
-    date: '25/06/2026',
+    date: '25/12/2026',
     time_slot: 'Morning 10:00',
     reason: 'Fever',
   });
@@ -207,7 +207,7 @@ test('POST /api/appointments rejects duplicate phone+date+slot (409)', async () 
 
 test('GET /api/appointments/check-duplicate returns duplicate: true when clash exists', async () => {
   const url = await ensureServer();
-  const res = await fetch(url + '/api/appointments/check-duplicate?phone=%2B91%2098765%2043210&date=25%2F06%2F2026&time_slot=Morning%2010%3A00', {
+  const res = await fetch(url + '/api/appointments/check-duplicate?phone=%2B91%2098765%2043210&date=25%2F12%2F2026&time_slot=Morning%2010%3A00', {
     headers: { 'Authorization': 'Bearer ' + token },
   });
   const json = await res.json();
@@ -218,7 +218,7 @@ test('GET /api/appointments/check-duplicate returns duplicate: true when clash e
 
 test('GET /api/appointments/check-duplicate returns duplicate: false when no clash', async () => {
   const url = await ensureServer();
-  const res = await fetch(url + '/api/appointments/check-duplicate?phone=%2B91%2098765%2043210&date=26%2F06%2F2026&time_slot=Morning%2010%3A00', {
+  const res = await fetch(url + '/api/appointments/check-duplicate?phone=%2B91%2098765%2043210&date=26%2F12%2F2026&time_slot=Morning%2010%3A00', {
     headers: { 'Authorization': 'Bearer ' + token },
   });
   const json = await res.json();
@@ -241,7 +241,7 @@ test('DELETE /api/appointments/:id removes an existing appointment (200)', async
   const create = await request('POST', '/api/appointments', {
     name: 'To Be Deleted',
     phone: '+91 11111 22222',
-    date: '27/06/2026',
+    date: '28/12/2026',
     time_slot: 'Afternoon 14:00',
     reason: 'Checkup',
   });
@@ -273,7 +273,7 @@ test('PATCH /api/appointments/:id updates status', async () => {
   const create = await request('POST', '/api/appointments', {
     name: 'Status Test',
     phone: '+91 33333 44444',
-    date: '28/06/2026',
+    date: '29/12/2026',
     time_slot: 'Evening 17:00',
     reason: 'Follow-up',
   });
@@ -289,7 +289,7 @@ test('PATCH /api/appointments/:id rejects invalid status (400)', async () => {
   const create = await request('POST', '/api/appointments', {
     name: 'Bad Status',
     phone: '+91 55555 66666',
-    date: '29/06/2026',
+    date: '30/12/2026',
     time_slot: 'Morning 09:00',
     reason: 'Test',
   });
@@ -306,7 +306,7 @@ test('POST /api/appointments without token returns 401', async () => {
   const r = await request('POST', '/api/appointments', {
     name: 'No Auth',
     phone: '+91 99999 99999',
-    date: '30/06/2026',
+    date: '31/12/2026',
     time_slot: 'Morning 09:00',
   }, false);
   assert.equal(r.status, 401);

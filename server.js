@@ -87,9 +87,9 @@ mongoose.set('bufferTimeoutMS', 3000);           // fail fast, never freeze a li
 let activeStore = createMemoryStore();
 let storeKind = 'memory';
 const DELEGATED = ['getSession', 'saveSession', 'clearSession', 'findDuplicate', 'countBooked',
-  'createAppointment', 'listAppointments', 'getAppointment', 'updateAppointmentStatus', 'deleteAppointment', 'stats',
+  'createAppointment', 'createAppointmentIfAvailable', 'listAppointments', 'getAppointment', 'updateAppointmentStatus', 'deleteAppointment', 'stats',
   'countUsers', 'findUserByEmail', 'createUser', 'updateUserPassword', 'logCallTurn', 'listCallLogs',
-  'listDoctors', 'createDoctor', 'updateDoctor', 'deleteDoctor', 'getClinic', 'saveClinic',
+  'listDoctors', 'getDoctor', 'createDoctor', 'updateDoctor', 'deleteDoctor', 'getClinic', 'saveClinic',
   'createLead', 'listLeads'];
 const store = {};
 for (const method of DELEGATED) {
@@ -153,7 +153,7 @@ async function initStore() {
   }
   try {
     await mongoose.connect(MONGODB_URI, { serverSelectionTimeoutMS: 8000 });
-    activeStore = createMongoStore();
+    activeStore = createMongoStore({ maxPerSlot: MAX_PER_SLOT });
     storeKind = 'mongo';
     console.log('✅ Connected to MongoDB - data will persist');
   } catch (err) {
@@ -472,9 +472,24 @@ app.patch('/api/appointments/:id', private_api, async (req, res) => {
 });
 
 // ---- manual appointment creation (dashboard use case) --------------------
+function slotWithinHours(slot, workingHours) {
+  if (!Array.isArray(workingHours) || workingHours.length === 0) return true; // no hours = always open
+  const match = /(\d{1,2}):(\d{2})$/.exec(String(slot || ''));
+  if (!match) return true; // window slots (e.g. "Morning") pass
+  const minutes = parseInt(match[1], 10) * 60 + parseInt(match[2], 10);
+  return workingHours.some((wh) => {
+    const toMin = (t) => {
+      const m = /^(\d{1,2}):(\d{2})$/.exec(String(t || ''));
+      return m ? parseInt(m[1], 10) * 60 + parseInt(m[2], 10) : null;
+    };
+    const start = toMin(wh.start), end = toMin(wh.end);
+    return start !== null && end !== null && minutes >= start && minutes <= end;
+  });
+}
+
 app.post('/api/appointments', private_api, async (req, res) => {
   const body = req.body || {};
-  const { name, phone, date, time_slot, reason, booking_for, status } = body;
+  const { name, phone, date, time_slot, reason, booking_for, status, doctorId } = body;
 
   if (!name || !String(name).trim()) {
     return res.status(400).json({ error: 'Patient name is required' });
@@ -489,41 +504,74 @@ app.post('/api/appointments', private_api, async (req, res) => {
     return res.status(400).json({ error: 'Time slot is required' });
   }
 
-  // Duplicate check: same phone + same date + same slot must not exist.
-  const existing = await store.findDuplicate({ phone, date, time_slot });
-  if (existing) {
-    return res.status(409).json({
-      error: 'An appointment already exists for this phone, date, and time slot',
-      appointment: existing,
-    });
+  // Validate date format (DD/MM/YYYY) and range (not in the past, not too far ahead).
+  const dateRes = BotEngine.parseDate(String(date).trim(), new Date());
+  if (dateRes.status !== 'ok') {
+    const reasons = {
+      invalid_date: 'Invalid date format. Use DD/MM/YYYY (e.g. 24/06/2026).',
+      past_date: 'Appointment date cannot be in the past.',
+      too_far: 'Appointment date is too far in the future.',
+      closed_day: 'The clinic is closed on that day of the week.',
+    };
+    return res.status(400).json({ error: reasons[dateRes.status] || 'Invalid date.' });
   }
 
-  // Slot cap (optional): prevent overbooking.
-  if (MAX_PER_SLOT > 0) {
-    const booked = await store.countBooked({ date, time_slot });
-    if (booked >= MAX_PER_SLOT) {
-      return res.status(409).json({ error: 'This time slot is already full' });
+  // Doctor availability validation (optional doctorId).
+  if (doctorId) {
+    try {
+      const doctor = await store.getDoctor(doctorId);
+      if (!doctor) {
+        return res.status(400).json({ error: 'Doctor not found.' });
+      }
+      const dateIso = BotEngine.isoForDateValue(String(date).trim());
+      const weekday = BotEngine.dayOfWeekFromDate(String(date).trim());
+      const holidays = Array.isArray(doctor.holidays) ? doctor.holidays : [];
+      const hours = Array.isArray(doctor.working_hours) ? doctor.working_hours : [];
+      const hasSchedule = hours.length > 0;
+      const offThatDay = weekday !== null && hasSchedule && !hours.some(h => Number(h.day) === weekday);
+      const outsideHours = hasSchedule && !slotWithinHours(time_slot, hours.filter(h => Number(h.day) === weekday));
+      if (holidays.includes(dateIso)) {
+        return res.status(400).json({ error: 'The clinic is closed on that date (holiday).' });
+      }
+      if (offThatDay) {
+        return res.status(400).json({ error: 'The doctor is not available on that day of the week.' });
+      }
+      if (outsideHours) {
+        return res.status(400).json({ error: 'The requested time slot is outside the doctor\'s working hours.' });
+      }
+    } catch (err) {
+      return res.status(500).json({ error: 'Doctor availability check failed.' });
     }
   }
 
-  try {
-    const appointment = await store.createAppointment({
-      name: String(name).trim(),
-      phone: String(phone).trim(),
-      date: String(date).trim(),
-      time_slot: String(time_slot).trim(),
-      time_slot_display: String(time_slot).trim(),
-      reason: reason ? String(reason).trim() : 'Not specified',
-      booking_for: booking_for || 'Self',
-      status: status || 'Confirmed',
-      priority: 'Normal',
-      source: 'dashboard',
-    });
-    res.status(201).json(appointment);
-  } catch (err) {
-    console.error('Create appointment failed:', err.message);
-    res.status(500).json({ error: 'Could not create appointment' });
+  // Atomic duplicate check + slot cap + create (transaction on MongoDB, lock on memory/file).
+  const result = await store.createAppointmentIfAvailable({
+    name: String(name).trim(),
+    phone: String(phone).trim(),
+    date: String(date).trim(),
+    time_slot: String(time_slot).trim(),
+    time_slot_display: String(time_slot).trim(),
+    reason: reason ? String(reason).trim() : 'Not specified',
+    booking_for: booking_for || 'Self',
+    status: status || 'Confirmed',
+    priority: 'Normal',
+    source: 'dashboard',
+    doctorId: doctorId || undefined,
+  }, MAX_PER_SLOT);
+
+  if (!result.ok) {
+    if (result.reason === 'duplicate') {
+      return res.status(409).json({
+        error: 'An appointment already exists for this phone, date, and time slot',
+      });
+    }
+    if (result.reason === 'slot_full') {
+      return res.status(409).json({ error: 'This time slot is already full' });
+    }
+    return res.status(500).json({ error: 'Could not create appointment' });
   }
+
+  res.status(201).json(result.appointment);
 });
 
 // Delete an appointment.

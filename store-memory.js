@@ -18,6 +18,26 @@ function createMemoryStore(options) {
   let nextId = 1;
   const id = () => 'mem_' + (nextId++);
 
+  // Process-local async mutex. The memory and file stores are single-instance
+  // (single process), so a process-local lock is sufficient to make
+  // check-then-create atomic within that instance.
+  let _busy = false;
+  const _waiters = [];
+  async function withLock(fn) {
+    if (_busy) {
+      await new Promise(resolve => _waiters.push(resolve));
+    }
+    _busy = true;
+    try {
+      return await fn();
+    } finally {
+      _busy = false;
+      if (_waiters.length) _waiters.shift()();
+    }
+  }
+
+  const maxPerSlot = (options && options.maxPerSlot != null) ? options.maxPerSlot : 0;
+
   const clone = (doc) => (doc ? JSON.parse(JSON.stringify(doc)) : doc);
 
   const DEFAULT_HOURS = [
@@ -73,6 +93,11 @@ function createMemoryStore(options) {
     // ---------------------------------------------------------- doctors
     async listDoctors() {
       return doctors.slice().sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt))).map(clone);
+    },
+
+    async getDoctor(docId) {
+      if (!docId) return null;
+      return clone(doctors.find(d => d._id === docId)) || null;
     },
 
     async createDoctor(data) {
@@ -214,6 +239,41 @@ function createMemoryStore(options) {
       }, data);
       appointments.push(doc);
       return clone(doc);
+    },
+
+    /** Atomically check duplicate + slot cap then create (process-local lock).
+     * Returns {ok, appointment} or {ok:false, reason}. */
+    async createAppointmentIfAvailable(data, maxPerSlotArg) {
+      return withLock(async () => {
+        const cap = maxPerSlotArg != null ? maxPerSlotArg : maxPerSlot;
+
+        // 1. Duplicate check inside the lock
+        const existing = appointments.find(
+          a => a.phone === data.phone && a.date === data.date && a.time_slot === data.time_slot && a.status === 'Confirmed'
+        );
+        if (existing) {
+          return { ok: false, reason: 'duplicate' };
+        }
+
+        // 2. Slot cap check inside the lock
+        if (cap > 0) {
+          const booked = appointments.filter(
+            a => a.date === data.date && a.time_slot === data.time_slot && a.status === 'Confirmed'
+          ).length;
+          if (booked >= cap) {
+            return { ok: false, reason: 'slot_full' };
+          }
+        }
+
+        // 3. Create inside the lock
+        const doc = Object.assign({
+          _id: id(),
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        }, data);
+        appointments.push(doc);
+        return { ok: true, appointment: clone(doc) };
+      });
     },
 
     async listAppointments({ status, q, date, limit = 200 } = {}) {

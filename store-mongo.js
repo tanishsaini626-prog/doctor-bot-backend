@@ -27,6 +27,14 @@ const AppointmentSchema = new mongoose.Schema({
   call_sid: { type: String, index: true },
 }, { timestamps: true });
 
+// Unique partial index: prevents two Confirmed appointments for the same
+// phone + date + time_slot at the database level. This is the atomic
+// backstop that stops double-booking even across server instances.
+AppointmentSchema.index(
+  { phone: 1, date: 1, time_slot: 1 },
+  { unique: true, partialFilterExpression: { status: 'Confirmed' } }
+);
+
 const SessionSchema = new mongoose.Schema({
   call_sid: { type: String, unique: true, index: true },
   phone: String,
@@ -44,11 +52,32 @@ const SessionSchema = new mongoose.Schema({
 const Appointment = mongoose.model('Appointment', AppointmentSchema);
 const CallSession = mongoose.model('CallSession', SessionSchema);
 
-function createMongoStore() {
+/** Run a function inside a MongoDB transaction. Aborts and re-throws on error. */
+async function withTransaction(fn) {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  try {
+    const result = await fn(session);
+    await session.commitTransaction();
+    return result;
+  } catch (err) {
+    try { await session.abortTransaction(); } catch { /* ignore abort errors */ }
+    throw err;
+  } finally {
+    session.endSession();
+  }
+}
+
+function createMongoStore({ maxPerSlot = 0 } = {}) {
   return {
     // ---------------------------------------------------------- doctors
     async listDoctors() {
       return Doctor.find({}).sort({ createdAt: 1 }).lean();
+    },
+
+    async getDoctor(docId) {
+      if (!docId) return null;
+      return Doctor.findById(docId).lean();
     },
 
     async createDoctor(data) {
@@ -152,6 +181,38 @@ function createMongoStore() {
 
     async createAppointment(data) {
       return (await Appointment.create(data)).toObject();
+    },
+
+    /** Atomically check duplicate + slot cap then create. Returns {ok, appointment} or {ok:false, reason}. */
+    async createAppointmentIfAvailable(data, maxPerSlot) {
+      return withTransaction(async (session) => {
+        // 1. Duplicate check inside the transaction
+        const existing = await Appointment.findOne({
+          phone: data.phone,
+          date: data.date,
+          time_slot: data.time_slot,
+          status: 'Confirmed',
+        }).session(session).lean();
+        if (existing) {
+          return { ok: false, reason: 'duplicate' };
+        }
+
+        // 2. Slot cap check inside the transaction
+        if (maxPerSlot > 0) {
+          const booked = await Appointment.countDocuments({
+            date: data.date,
+            time_slot: data.time_slot,
+            status: 'Confirmed',
+          }).session(session);
+          if (booked >= maxPerSlot) {
+            return { ok: false, reason: 'slot_full' };
+          }
+        }
+
+        // 3. Create inside the transaction
+        const doc = await Appointment.create([data], { session });
+        return { ok: true, appointment: doc[0].toObject() };
+      });
     },
 
     async listAppointments({ status, q, date, limit = 200 } = {}) {
