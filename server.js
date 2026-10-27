@@ -28,10 +28,10 @@ const path = require('path');
 
 const BotEngine = require('./bot-engine');
 const { createConversation } = require('./conversation');
-const { createMongoStore } = require('./store-mongo');
+const { createMongoStore, ensureIndexes } = require('./store-mongo');
 const { createMemoryStore } = require('./store-memory');
 const { createFileStore } = require('./store-file');
-const { createAuth, requireAuth, ensureSeedAdmin } = require('./auth');
+const { createAuth, ensureSeedAdmin } = require('./auth');
 const { requireTwilioSignature } = require('./twilio-signature');
 
 // --- configuration validation (fail fast on production-required secrets) ---
@@ -48,8 +48,62 @@ const PORT = assertEnv('PORT') || 5000;
 const MONGODB_URI = process.env.MONGODB_URI || '';   // optional; required only when STORE=mongo
 const MAX_PER_SLOT = parseInt(process.env.MAX_PER_SLOT || '0', 10);   // 0 = unlimited
 const STORE_MODE = (process.env.STORE || 'auto').toLowerCase();       // auto | mongo | file | memory
+const NODE_ENV = process.env.NODE_ENV || 'development';
 // Where the file-backed store keeps its JSON (ignored by git via .data/).
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, '.data', 'store.json');
+
+// ---- production readiness checks ------------------------------------------
+// In production, JWT_SECRET must be strong enough to resist brute-forcing.
+// A short, guessable, or default secret would let attackers forge dashboard
+// tokens. We check length, minimum entropy, and reject known defaults.
+if (NODE_ENV === 'production') {
+  const jwtSecret = process.env.JWT_SECRET || '';
+  if (!jwtSecret) {
+    console.error('FATAL: JWT_SECRET is required in production (NODE_ENV=production).');
+    process.exit(1);
+  }
+  if (jwtSecret.length < 32) {
+    console.error('FATAL: JWT_SECRET must be at least 32 characters in production (got ' + jwtSecret.length + ').');
+    process.exit(1);
+  }
+  // Reject known weak defaults that attackers will try first.
+  const WEAK_DEFAULTS = [
+    'secret', 'password', 'changeme', 'default', 'changemeplease',
+    'jwtsecret', 'jwt_secret', 'mysecretkey', 'supersecret', 'medibot-secret',
+    'test-secret', 'development-secret', 'production-secret',
+  ];
+  const lower = jwtSecret.toLowerCase();
+  if (WEAK_DEFAULTS.includes(lower)) {
+    console.error('FATAL: JWT_SECRET is a known weak default. Set a strong, unique value in your secret manager.');
+    process.exit(1);
+  }
+  // Reject secrets with less than ~28 bits of entropy: all same char,
+  // strictly sequential runs (e.g. "aaaa...", "abcd...", "1234..."), or
+  // keyboard walks (e.g. "qwerty...", "asdfg...").
+  const allSame = /^(.)\1{31,}$/.test(jwtSecret);
+  const seqUp = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  const seqDown = seqUp.split('').reverse().join('');
+  let sequential = false;
+  for (let i = 0; i <= seqUp.length - 32; i++) {
+    if (jwtSecret.includes(seqUp.slice(i, i + 32)) || jwtSecret.includes(seqDown.slice(i, i + 32))) {
+      sequential = true;
+      break;
+    }
+  }
+  const keyboardWalks = ['qwertyuiopasdfghjklzxcvbnm', 'mnbvcxzlkjhgfdsapoiuytrewq'];
+  let keyboardWalk = false;
+  for (const walk of keyboardWalks) {
+    if (jwtSecret.toLowerCase().includes(walk.slice(0, 32))) {
+      keyboardWalk = true;
+      break;
+    }
+  }
+  if (allSame || sequential || keyboardWalk) {
+    console.error('FATAL: JWT_SECRET has insufficient entropy (repeated, sequential, or keyboard-walk pattern). Use a cryptographically random value.');
+    process.exit(1);
+  }
+  console.log('🔐 Production mode: JWT secret strength OK (' + jwtSecret.length + ' chars).');
+}
 
 const app = express();
 app.set('trust proxy', 1);                       // correct https:// behind ngrok / Render
@@ -90,7 +144,8 @@ const DELEGATED = ['getSession', 'saveSession', 'clearSession', 'findDuplicate',
   'createAppointment', 'createAppointmentIfAvailable', 'listAppointments', 'getAppointment', 'updateAppointmentStatus', 'deleteAppointment', 'stats',
   'countUsers', 'findUserByEmail', 'createUser', 'updateUserPassword', 'logCallTurn', 'listCallLogs',
   'listDoctors', 'getDoctor', 'createDoctor', 'updateDoctor', 'deleteDoctor', 'getClinic', 'saveClinic',
-  'createLead', 'listLeads'];
+  'createLead', 'listLeads',
+  'createTokenBlocklist', 'isTokenBlocked', 'clearExpiredTokenBlocklist'];
 const store = {};
 for (const method of DELEGATED) {
   store[method] = (...args) => activeStore[method](...args);
@@ -102,6 +157,22 @@ for (const method of DELEGATED) {
 let storeInitialized = false;
 const storeReadyPromise = (async () => {
   await initStore();
+  // Ensure indexes before accepting traffic: catches duplicate Confirmed
+  // appointments that would block the unique partial index, and creates the
+  // token blocklist TTL index. Fails fast so a human can resolve conflicts.
+  if (storeKind === 'mongo') {
+    try {
+      await ensureIndexes();
+      console.log('📇 MongoDB indexes verified (unique partial on appointments, TTL on token blocklist).');
+    } catch (err) {
+      console.error('❌ Index check failed:', err.message);
+      if (STORE_MODE === 'mongo' || NODE_ENV === 'production') {
+        console.error('   STORE=mongo or production was requested, so the server will not start.');
+        process.exit(1);
+      }
+      // For auto/file mode we still continue (index is best-effort on fallback stores).
+    }
+  }
   try {
     const seeded = await ensureSeedAdmin(store);
     if (seeded && seeded.password_updated) {
@@ -128,6 +199,17 @@ function requireStoreReady(req, res, next) {
 }
 
 async function initStore() {
+  if (NODE_ENV === 'production') {
+    if (STORE_MODE === 'memory' || STORE_MODE === 'file') {
+      console.error('FATAL: STORE=' + STORE_MODE + ' is not permitted in production (NODE_ENV=production). Production requires MongoDB.');
+      process.exit(1);
+    }
+    if (!MONGODB_URI) {
+      console.error('FATAL: MONGODB_URI is required in production (NODE_ENV=production). Set it in your environment/secret manager.');
+      process.exit(1);
+    }
+  }
+
   // STORE=mongo must never fall back silently to file/memory.
   if (STORE_MODE === 'mongo' && !MONGODB_URI) {
     console.error('FATAL: STORE=mongo requires MONGODB_URI; set it in your environment/secret manager and restart.');
@@ -158,8 +240,8 @@ async function initStore() {
     console.log('✅ Connected to MongoDB - data will persist');
   } catch (err) {
     console.error('❌ MongoDB connection failed:', err.message);
-    if (STORE_MODE === 'mongo') {
-      console.error('   STORE=mongo was requested, so the server will not start.');
+    if (STORE_MODE === 'mongo' || NODE_ENV === 'production') {
+      console.error('   FATAL: MongoDB connection failed in production / STORE=mongo. Server will not start: ' + err.message);
       process.exit(1);
     }
     activeStore = createFileStore(DATA_FILE);
@@ -194,7 +276,7 @@ const bot = createConversation({
   confirmBeforeBooking: CONFIRM_BEFORE_BOOKING,
   doctorProvider,
 });
-const { router: authRouter } = createAuth(store, requireStoreReady);
+const { router: authRouter, requireAuth, optionalAuth } = createAuth(store, requireStoreReady);
 
 // ---- 2b. admin account ---------------------------------------------------
 // JWT_SECRET is required in .env (generate one, never commit it). The first
@@ -858,6 +940,16 @@ app.get('/api/stats', private_api, async (req, res) => {
 app.use((req, res) => res.status(404).json({ error: 'Unknown route: ' + req.path }));
 
 // ---- 6. go --------------------------------------------------------------
+// Periodic cleanup of expired token blocklist entries (also handled by TTL
+// index in MongoDB, but application-level cleanup ensures prompt reuse of jti).
+setInterval(async () => {
+  try {
+    await store.clearExpiredTokenBlocklist();
+  } catch {
+    // best-effort cleanup; never crash the server
+  }
+}, 60 * 60 * 1000).unref();
+
 if (require.main === module) {
   app.listen(PORT, () => {
     console.log('===================================');

@@ -18,20 +18,6 @@ const crypto = require('crypto');
 
 const TOKEN_HOURS = 12;
 
-// ---- token blocklist (for logout / revocation) ---------------------------
-const TOKEN_BLOCKLIST = new Set(); // jti values
-
-function blockToken(jti) {
-  if (!jti) return;
-  TOKEN_BLOCKLIST.add(jti);
-  // auto-cleanup after token expiry (12h)
-  setTimeout(() => TOKEN_BLOCKLIST.delete(jti), TOKEN_HOURS * 60 * 60 * 1000);
-}
-
-function isTokenBlocked(jti) {
-  return jti && TOKEN_BLOCKLIST.has(jti);
-}
-
 function createAuth(store, requireStoreReady) {
   const router = express.Router();
 
@@ -208,14 +194,18 @@ function createAuth(store, requireStoreReady) {
   });
 
   // ---- logout --------------------------------------------------------------
-  // Revokes the current bearer token by adding its jti to the blocklist.
+  // Revokes the current bearer token by adding its jti to the persistent
+  // token blocklist (survives restarts, shared across instances).
   router.post('/auth/logout', optionalAuth, async (req, res) => {
     const header = req.headers.authorization || '';
     const m = header.match(/^Bearer\s+(\S+)$/i);
     if (m) {
       try {
         const payload = jwt.verify(m[1], process.env.JWT_SECRET);
-        if (payload.jti) blockToken(payload.jti);
+        if (payload.jti) {
+          const expiresAt = new Date(Date.now() + TOKEN_HOURS * 60 * 60 * 1000);
+          await store.createTokenBlocklist(payload.jti, expiresAt);
+        }
       } catch {
         // token invalid or already expired - nothing to revoke
       }
@@ -234,7 +224,76 @@ function createAuth(store, requireStoreReady) {
     }
   });
 
-  return { router, signToken, publicUser, TOKEN_HOURS };
+  // ---- requireAuth (async, store-backed blocklist) -------------------------
+  // Middleware: extracts Bearer JWT from Authorization header, verifies it,
+  // and attaches { sub, email, role, clinic } to req.user. Fails closed (401)
+  // if the token is revoked or the store cannot be consulted.
+  async function requireAuth(req, res, next) {
+    const header = req.headers.authorization || '';
+    const m = header.match(/^Bearer\s+(\S+)$/i);
+    if (!m) return res.status(401).json({ error: 'Authentication required' });
+    let payload;
+    try {
+      payload = jwt.verify(m[1], process.env.JWT_SECRET);
+    } catch {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+    // Token signature is valid; now check revocation. A store (DB) outage
+    // must fail closed with 503 so infrastructure failures are not
+    // misreported as invalid credentials.
+    let blocked;
+    try {
+      blocked = await store.isTokenBlocked(payload.jti);
+    } catch (err) {
+      console.error('Token revocation check failed:', err.message);
+      return res.status(503).json({ error: 'Service temporarily unavailable: revocation check failed. Please retry.' });
+    }
+    if (blocked) {
+      return res.status(401).json({ error: 'Token has been revoked' });
+    }
+    req.user = {
+      sub: payload.sub,
+      email: payload.email,
+      role: payload.role,
+      clinic: payload.clinic || null,
+    };
+    next();
+  }
+
+  // ---- optionalAuth (async, store-backed blocklist) ------------------------
+  // Same as requireAuth but does not fail if no token is present. Sets req.user
+  // when a valid token is provided; otherwise req.user stays undefined.
+  async function optionalAuth(req, res, next) {
+    const header = req.headers.authorization || '';
+    const m = header.match(/^Bearer\s+(\S+)$/i);
+    if (!m) return next();
+    try {
+      const payload = jwt.verify(m[1], process.env.JWT_SECRET);
+      // Fail closed: if the revocation store is unreachable, do NOT attach
+      // the user (treat the token as potentially revoked). This prevents a
+      // DB outage from allowing a revoked token through.
+      let blocked;
+      try {
+        blocked = await store.isTokenBlocked(payload.jti);
+      } catch {
+        return next(); // next() with req.user unset = token treated as invalid
+      }
+      if (blocked) {
+        return next(); // revoked → do not attach user
+      }
+      req.user = {
+        sub: payload.sub,
+        email: payload.email,
+        role: payload.role,
+        clinic: payload.clinic || null,
+      };
+    } catch {
+      // ignore invalid tokens in optional mode
+    }
+    next();
+  }
+
+  return { router, signToken, publicUser, TOKEN_HOURS, requireAuth, optionalAuth };
 }
 
 /**
@@ -270,55 +329,12 @@ async function ensureSeedAdmin(store) {
   }
   return null;
 }
-// ---- requireAuth ----------------------------------------------------------
-// Middleware: extracts Bearer JWT from Authorization header, verifies it,
-// and attaches { sub, email, role, clinic } to req.user. Fails closed (401).
-function requireAuth(req, res, next) {
-  const header = req.headers.authorization || '';
-  const m = header.match(/^Bearer\s+(\S+)$/i);
-  if (!m) return res.status(401).json({ error: 'Authentication required' });
-  try {
-    const payload = jwt.verify(m[1], process.env.JWT_SECRET);
-    if (isTokenBlocked(payload.jti)) {
-      return res.status(401).json({ error: 'Token has been revoked' });
-    }
-    req.user = {
-      sub: payload.sub,
-      email: payload.email,
-      role: payload.role,
-      clinic: payload.clinic || null,
-    };
-    next();
-  } catch (err) {
-    return res.status(401).json({ error: 'Invalid or expired token' });
-  }
-}
-
-// ---- optionalAuth ---------------------------------------------------------
-// Same as requireAuth but does not fail if no token is present. Sets req.user
-// when a valid token is provided; otherwise req.user stays undefined.
-function optionalAuth(req, res, next) {
-  const header = req.headers.authorization || '';
-  const m = header.match(/^Bearer\s+(\S+)$/i);
-  if (!m) return next();
-  try {
-    const payload = jwt.verify(m[1], process.env.JWT_SECRET);
-    if (isTokenBlocked(payload.jti)) {
-      return; // do not attach a revoked token's user
-    }
-    req.user = {
-      sub: payload.sub,
-      email: payload.email,
-      role: payload.role,
-      clinic: payload.clinic || null,
-    };
-  } catch {
-    // ignore invalid tokens in optional mode
-  }
-  next();
-}
-
-module.exports = { createAuth, requireAuth, optionalAuth, ensureSeedAdmin };
+// ---- requireAuth and optionalAuth are now async closures inside
+// createAuth (they need store access for the persistent blocklist). These
+// are not exported at module level; server.js destructures them from
+// createAuth's return value.
+// ---------------------------------------------------------------------------
+module.exports = { createAuth, ensureSeedAdmin };
 
 
 

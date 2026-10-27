@@ -153,7 +153,7 @@ test('concurrent slot-cap overflow: only MAX_PER_SLOT bookings succeed', async (
 test('subsequent booking for a different slot still works after concurrent contention', async () => {
   const r = await request('POST', '/api/appointments', {
     name: 'After Concurrency', phone: '+91 90000 44444',
-    date: '17/01/2027', time_slot: 'Evening 17:00', reason: 'After contention',
+    date: '18/01/2027', time_slot: 'Evening 17:00', reason: 'After contention',
   });
   assert.equal(r.status, 201, 'subsequent booking should succeed: ' + JSON.stringify(r.json));
   assert.ok(r.json && r.json._id);

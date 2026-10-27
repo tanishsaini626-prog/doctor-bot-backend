@@ -17,6 +17,7 @@ function createMemoryStore(options) {
   let clinic = null;
   let nextId = 1;
   const id = () => 'mem_' + (nextId++);
+  const tokenBlocklist = new Map(); // jti -> { expiresAt: Date }
 
   // Process-local async mutex. The memory and file stores are single-instance
   // (single process), so a process-local lock is sufficient to make
@@ -69,6 +70,7 @@ function createMemoryStore(options) {
         leads,
         clinic,
         nextId,
+        tokenBlocklist: [...tokenBlocklist.entries()],
       };
     },
 
@@ -88,6 +90,10 @@ function createMemoryStore(options) {
       if (Array.isArray(snapshot.leads)) leads.splice(0, leads.length, ...snapshot.leads);
       if (snapshot.clinic !== undefined) clinic = snapshot.clinic;
       if (Number.isFinite(snapshot.nextId) && snapshot.nextId > nextId) nextId = snapshot.nextId;
+      if (Array.isArray(snapshot.tokenBlocklist)) {
+        tokenBlocklist.clear();
+        for (const [k, v] of snapshot.tokenBlocklist) tokenBlocklist.set(k, v);
+      }
     },
 
     // ---------------------------------------------------------- doctors
@@ -348,6 +354,31 @@ function createMemoryStore(options) {
         .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
         .slice(0, Math.min(Number(limit) || 200, 500))
         .map(clone);
+    },
+
+    // ------------------------------------------------------------- token blocklist (in-memory fallback)
+    async createTokenBlocklist(jti, expiresAt) {
+      if (!jti) return;
+      tokenBlocklist.set(jti, { expiresAt: new Date(expiresAt) });
+    },
+
+    async isTokenBlocked(jti) {
+      if (!jti) return false;
+      const entry = tokenBlocklist.get(jti);
+      if (!entry) return false;
+      // Application-level expiry check: TTL cleanup is async, don't rely on it.
+      if (new Date() >= entry.expiresAt) {
+        tokenBlocklist.delete(jti);
+        return false;
+      }
+      return true;
+    },
+
+    async clearExpiredTokenBlocklist() {
+      const now = new Date();
+      for (const [jti, entry] of tokenBlocklist.entries()) {
+        if (now >= entry.expiresAt) tokenBlocklist.delete(jti);
+      }
     },
   };
 }

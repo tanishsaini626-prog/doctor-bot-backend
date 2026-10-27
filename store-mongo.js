@@ -49,8 +49,68 @@ const SessionSchema = new mongoose.Schema({
   completed: { type: Boolean, default: false },
 }, { timestamps: true });
 
+// Token blocklist for persistent JWT revocation (survives restarts, shared across instances).
+// expiresAt drives MongoDB TTL auto-deletion; application logic also checks expiry
+// because TTL deletion is asynchronous and not immediate.
+const TokenBlocklistSchema = new mongoose.Schema({
+  jti: { type: String, unique: true, index: true },
+  expiresAt: { type: Date, index: { expireAfterSeconds: 0 } },
+}, { timestamps: true });
+
 const Appointment = mongoose.model('Appointment', AppointmentSchema);
 const CallSession = mongoose.model('CallSession', SessionSchema);
+const TokenBlocklist = mongoose.model('TokenBlocklist', TokenBlocklistSchema);
+
+/**
+ * Ensure MongoDB indexes are created before accepting traffic.
+ * - Detects existing duplicate Confirmed appointments that would block the unique partial index.
+ * - Does NOT auto-cancel or modify any appointments; reports conflicts for manual resolution.
+ * - Creates the unique partial index and the token blocklist TTL index.
+ * Throws if duplicates exist or index creation/verification fails.
+ */
+async function ensureIndexes() {
+  // 1. Detect existing duplicate Confirmed appointments before creating the unique index.
+  const duplicates = await Appointment.aggregate([
+    { $match: { status: 'Confirmed' } },
+    {
+      $group: {
+        _id: { phone: '$phone', date: '$date', time_slot: '$time_slot' },
+        count: { $sum: 1 },
+        ids: { $push: '$_id' },
+      },
+    },
+    { $match: { count: { $gt: 1 } } },
+    { $limit: 10 },
+  ]);
+
+  if (duplicates.length > 0) {
+    const detail = duplicates.map((d) =>
+      `phone=${d._id.phone}, date=${d._id.date}, time_slot=${d._id.time_slot}, count=${d.count}`
+    ).join('; ');
+    throw new Error(
+      'Duplicate Confirmed appointments found before creating unique index. ' +
+      'Resolve manually before restarting. Duplicates: ' + detail
+    );
+  }
+
+  // 2. Create indexes explicitly (not relying on auto-indexing on model init).
+  await Appointment.createIndexes();
+  await TokenBlocklist.createIndexes();
+
+  // 3. Verify the unique partial index exists and is correct.
+  const indexes = await Appointment.collection.indexes();
+  const hasUniquePartial = indexes.some((idx) =>
+    idx.unique === true &&
+    idx.partialFilterExpression &&
+    String(idx.partialFilterExpression.status) === 'Confirmed' &&
+    idx.key.phone === 1 &&
+    idx.key.date === 1 &&
+    idx.key.time_slot === 1
+  );
+  if (!hasUniquePartial) {
+    throw new Error('Unique partial index on appointments could not be verified after creation.');
+  }
+}
 
 /** Run a function inside a MongoDB transaction. Aborts and re-throws on error. */
 async function withTransaction(fn) {
@@ -259,7 +319,31 @@ function createMongoStore({ maxPerSlot = 0 } = {}) {
     async listLeads({ limit = 200 } = {}) {
       return Lead.find({}).sort({ createdAt: -1 }).limit(Math.min(Number(limit) || 200, 500)).lean();
     },
+
+    // ------------------------------------------------------------- token blocklist (persistent revocation)
+    async createTokenBlocklist(jti, expiresAt) {
+      if (!jti) return;
+      await TokenBlocklist.updateOne(
+        { jti },
+        { $set: { jti, expiresAt: new Date(expiresAt) } },
+        { upsert: true }
+      );
+    },
+
+    async isTokenBlocked(jti) {
+      if (!jti) return false;
+      const doc = await TokenBlocklist.findOne({ jti }).lean();
+      if (!doc) return false;
+      if (doc.expiresAt && new Date() >= new Date(doc.expiresAt)) {
+        return false;
+      }
+      return true;
+    },
+
+    async clearExpiredTokenBlocklist() {
+      await TokenBlocklist.deleteMany({ expiresAt: { $lt: new Date() } });
+    },
   };
 }
 
-module.exports = { createMongoStore, Appointment, CallSession, Clinic, Doctor, User, CallLog, Lead };
+module.exports = { createMongoStore, ensureIndexes, Appointment, CallSession, TokenBlocklist, Clinic, Doctor, User, CallLog, Lead };

@@ -26,6 +26,7 @@ const MUTATING = new Set([
   'saveSession', 'clearSession', 'createAppointment', 'updateAppointmentStatus', 'deleteAppointment',
   'createUser', 'updateUserPassword', 'logCallTurn',
   'createDoctor', 'updateDoctor', 'deleteDoctor', 'saveClinic', 'createLead',
+  'createTokenBlocklist',
 ]);
 
 function createFileStore(filePath, options = {}) {
