@@ -18,6 +18,9 @@ function createMemoryStore(options) {
   let nextId = 1;
   const id = () => 'mem_' + (nextId++);
   const tokenBlocklist = new Map(); // jti -> { expiresAt: Date }
+  // Clinic-scoped: key = `clinic-${clinic}||'default':ip-${ip}`
+  const loginRateLimit = new Map(); // ip -> { count, reset, clinic }
+  const failedLogins = new Map();   // email -> { count, lockedUntil, clinic }
 
   // Process-local async mutex. The memory and file stores are single-instance
   // (single process), so a process-local lock is sufficient to make
@@ -71,6 +74,8 @@ function createMemoryStore(options) {
         clinic,
         nextId,
         tokenBlocklist: [...tokenBlocklist.entries()],
+        loginRateLimit: [...loginRateLimit.entries()],
+        failedLogins: [...failedLogins.entries()],
       };
     },
 
@@ -93,6 +98,14 @@ function createMemoryStore(options) {
       if (Array.isArray(snapshot.tokenBlocklist)) {
         tokenBlocklist.clear();
         for (const [k, v] of snapshot.tokenBlocklist) tokenBlocklist.set(k, v);
+      }
+      if (Array.isArray(snapshot.loginRateLimit)) {
+        loginRateLimit.clear();
+        for (const [k, v] of snapshot.loginRateLimit) loginRateLimit.set(k, v);
+      }
+      if (Array.isArray(snapshot.failedLogins)) {
+        failedLogins.clear();
+        for (const [k, v] of snapshot.failedLogins) failedLogins.set(k, v);
       }
     },
 
@@ -379,6 +392,77 @@ function createMemoryStore(options) {
       for (const [jti, entry] of tokenBlocklist.entries()) {
         if (now >= entry.expiresAt) tokenBlocklist.delete(jti);
       }
+    },
+
+    // ------------------------------------------------------------- login protection (in-memory)
+    // Per-IP rate limiting and per-account lockout. Guarded by withLock for
+    // atomic check-then-update within a single instance.
+    async checkLoginRateLimit(ip, opts = {}) {
+      const max = Number(opts.max || 15);
+      const windowMs = Number(opts.windowMs || 60000);
+      const clinicKey = opts.clinic || 'default';
+      return withLock(async () => {
+        const now = Date.now();
+        const rateKey = `clinic-${clinicKey}:ip-${ip}`;
+        const entry = loginRateLimit.get(rateKey);
+        if (!entry) {
+          loginRateLimit.set(rateKey, { count: 1, reset: now + windowMs, clinic: clinicKey });
+          return { allowed: true, remaining: max - 1 };
+        }
+        if (now >= entry.reset) {
+          entry.count = 1;
+          entry.reset = now + windowMs;
+          return { allowed: true, remaining: max - 1 };
+        }
+        if (entry.count >= max) {
+          return { allowed: false, remaining: 0, resetAt: entry.reset };
+        }
+        entry.count += 1;
+        return { allowed: true, remaining: max - entry.count };
+      });
+    },
+
+    async isAccountLocked(email, opts = {}) {
+      const maxAttempts = Number(opts.maxAttempts || 5);
+      const lockoutWindowMs = Number(opts.lockoutWindowMs || 900000);
+      const clinicKey = opts.clinic || 'default';
+      return withLock(async () => {
+        const entry = failedLogins.get(`clinic-${clinicKey}:email-${email}`);
+        if (!entry) return { locked: false };
+        const now = Date.now();
+        if (now >= entry.lockedUntil) {
+          failedLogins.delete(`clinic-${clinicKey}:email-${email}`);
+          return { locked: false };
+        }
+        return { locked: true, lockedUntil: entry.lockedUntil };
+      });
+    },
+
+    async recordLoginFailure(email, opts = {}) {
+      const maxAttempts = Number(opts.maxAttempts || 5);
+      const lockoutWindowMs = Number(opts.lockoutWindowMs || 900000);
+      const clinicKey = opts.clinic || 'default';
+      return withLock(async () => {
+        const now = Date.now();
+        const entry = failedLogins.get(`clinic-${clinicKey}:email-${email}`) || { count: 0, lockedUntil: 0 };
+        entry.count += 1;
+        if (entry.count >= maxAttempts) {
+          entry.lockedUntil = now + lockoutWindowMs;
+        }
+        failedLogins.set(`clinic-${clinicKey}:email-${email}`, entry);
+        return {
+          count: entry.count,
+          locked: entry.count >= maxAttempts,
+          lockedUntil: entry.lockedUntil,
+        };
+      });
+    },
+
+    async resetLoginFailure(email, opts = {}) {
+      const clinicKey = opts.clinic || 'default';
+      return withLock(async () => {
+        failedLogins.delete(`clinic-${clinicKey}:email-${email}`);
+      });
     },
   };
 }

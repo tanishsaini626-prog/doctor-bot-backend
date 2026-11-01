@@ -57,9 +57,24 @@ const TokenBlocklistSchema = new mongoose.Schema({
   expiresAt: { type: Date, index: { expireAfterSeconds: 0 } },
 }, { timestamps: true });
 
+// Login protection: per-IP rate limiting and per-account lockout.
+// key is "rate:ip:<ip>" or "lock:email:<email>".
+// count tracks attempts; windowStart anchors the rate-limit window;
+// lockedUntil is set when lockout threshold is reached.
+// expiresAt drives MongoDB TTL auto-deletion; application logic also checks
+// expiry because TTL deletion is asynchronous and not immediate.
+const LoginAttemptSchema = new mongoose.Schema({
+  key: { type: String, unique: true, index: true },
+  count: { type: Number, default: 0 },
+  windowStart: { type: Date },
+  lockedUntil: { type: Date },
+  expiresAt: { type: Date, index: { expireAfterSeconds: 0 } },
+}, { timestamps: true });
+
 const Appointment = mongoose.model('Appointment', AppointmentSchema);
 const CallSession = mongoose.model('CallSession', SessionSchema);
 const TokenBlocklist = mongoose.model('TokenBlocklist', TokenBlocklistSchema);
+const LoginAttempt = mongoose.model('LoginAttempt', LoginAttemptSchema);
 
 /**
  * Ensure MongoDB indexes are created before accepting traffic.
@@ -343,7 +358,76 @@ function createMongoStore({ maxPerSlot = 0 } = {}) {
     async clearExpiredTokenBlocklist() {
       await TokenBlocklist.deleteMany({ expiresAt: { $lt: new Date() } });
     },
+
+    // ------------------------------------------------------------- login protection (MongoDB)
+    // Per-IP rate limiting and per-account lockout using atomic MongoDB
+    // operations. Fixed minute-aligned windows for rate limiting; count-based
+    // lockout with $inc for atomic increment.
+    async checkLoginRateLimit(ip, opts = {}) {
+      const max = Number(opts.max || 15);
+      const windowMs = Number(opts.windowMs || 60000);
+      const clinicKey = opts.clinic || 'default';
+      const key = `clinic-${clinicKey}:rate:ip:${ip}`;
+      const now = new Date();
+
+      // Fixed minute-aligned window: all requests in the same minute share a
+      // counter. This makes the check-then-increment atomic via $inc + upsert.
+      const windowStart = new Date(now.getTime() - (now.getTime() % windowMs));
+
+      const doc = await LoginAttempt.findOneAndUpdate(
+        { key, windowStart },
+        { $inc: { count: 1 } },
+        { new: true, upsert: true, setDefaultsOnInsert: true }
+      );
+
+      if (doc.count > max) {
+        return { allowed: false, remaining: 0, resetAt: new Date(windowStart.getTime() + windowMs) };
+      }
+      return { allowed: true, remaining: max - doc.count };
+    },
+
+    async isAccountLocked(email, opts = {}) {
+      const lockoutWindowMs = Number(opts.lockoutWindowMs || 900000);
+      const clinicKey = opts.clinic || 'default';
+      const key = `clinic-${clinicKey}:lock:email:${email}`;
+      const doc = await LoginAttempt.findOne({ key }).lean();
+      if (!doc) return { locked: false };
+      if (doc.lockedUntil && new Date() >= new Date(doc.lockedUntil)) {
+        // Lock expired - clear it
+        await LoginAttempt.deleteOne({ key });
+        return { locked: false };
+      }
+      return { locked: true, lockedUntil: doc.lockedUntil };
+    },
+
+    async recordLoginFailure(email, opts = {}) {
+      const maxAttempts = Number(opts.maxAttempts || 5);
+      const lockoutWindowMs = Number(opts.lockoutWindowMs || 900000);
+      const clinicKey = opts.clinic || 'default';
+      const key = `clinic-${clinicKey}:lock:email:${email}`;
+      const now = new Date();
+
+      // Atomic increment via $inc + upsert
+      const doc = await LoginAttempt.findOneAndUpdate(
+        { key },
+        { $inc: { count: 1 } },
+        { new: true, upsert: true, setDefaultsOnInsert: true }
+      );
+
+      if (doc.count >= maxAttempts && !doc.lockedUntil) {
+        const lockedUntil = new Date(now.getTime() + lockoutWindowMs);
+        await LoginAttempt.updateOne({ key }, { $set: { lockedUntil } });
+        return { count: doc.count, locked: true, lockedUntil };
+      }
+      return { count: doc.count, locked: doc.count >= maxAttempts, lockedUntil: doc.lockedUntil };
+    },
+
+    async resetLoginFailure(email, opts = {}) {
+      const clinicKey = opts.clinic || 'default';
+      const key = `clinic-${clinicKey}:lock:email:${email}`;
+      await LoginAttempt.deleteOne({ key });
+    },
   };
 }
 
-module.exports = { createMongoStore, ensureIndexes, Appointment, CallSession, TokenBlocklist, Clinic, Doctor, User, CallLog, Lead };
+module.exports = { createMongoStore, ensureIndexes, Appointment, CallSession, TokenBlocklist, LoginAttempt, Clinic, Doctor, User, CallLog, Lead };
