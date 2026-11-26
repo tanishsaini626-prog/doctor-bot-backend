@@ -11,6 +11,7 @@
  * ========================================================================== */
 
 const BotEngine = require('./bot-engine');
+const { getBillingMonth } = require('./subscription');
 
 const GREETING = 'नमस्ते! मैं डॉ. शर्मा क्लिनिक से बोल रही हूँ। अपॉइंटमेंट बुक करने के लिए कृपया अपना पूरा नाम बताइए।';
 
@@ -41,19 +42,45 @@ function readbackSpeech(slots) {
     'अपॉइंटमेंट बुक कर दूँ? सही है?';
 }
 
-/** Is this 24h HH:MM inside any of the doctor's working hours for that weekday? */
+function parseTimeToMinutes(str) {
+  if (!str) return null;
+  const s = String(str).trim();
+  const m12 = /^(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)$/i.exec(s);
+  if (m12) {
+    let hours = parseInt(m12[1], 10);
+    const mins = m12[2] ? parseInt(m12[2], 10) : 0;
+    const isPm = /p/i.test(m12[3]);
+    if (isPm && hours < 12) hours += 12;
+    if (!isPm && hours === 12) hours = 0;
+    return hours * 60 + mins;
+  }
+  const m24 = /^(\d{1,2}):(\d{2})$/.exec(s);
+  if (m24) {
+    return parseInt(m24[1], 10) * 60 + parseInt(m24[2], 10);
+  }
+  const mEmbedded = /(\d{1,2}):(\d{2})(?:\s*(am|pm))?/i.exec(s);
+  if (mEmbedded) {
+    let hours = parseInt(mEmbedded[1], 10);
+    const mins = parseInt(mEmbedded[2], 10);
+    if (mEmbedded[3]) {
+      const isPm = /p/i.test(mEmbedded[3]);
+      if (isPm && hours < 12) hours += 12;
+      if (!isPm && hours === 12) hours = 0;
+    }
+    return hours * 60 + mins;
+  }
+  return null;
+}
+
+/** Is this slot inside any of the doctor's working hours for that weekday? */
 function slotWithinHours(slot, workingHours) {
   if (!Array.isArray(workingHours) || workingHours.length === 0) return true;  // no hours = always open
-  const match = /(\d{1,2}):(\d{2})$/.exec(String(slot || ''));
-  if (!match) return true;                                    // window slots (e.g. "Morning") pass
-  const minutes = parseInt(match[1], 10) * 60 + parseInt(match[2], 10);
+  const slotMinutes = parseTimeToMinutes(slot);
+  if (slotMinutes === null) return true; // window slots (e.g. "Morning") pass
   return workingHours.some((wh) => {
-    const toMin = (t) => {
-      const m = /^(\d{1,2}):(\d{2})$/.exec(String(t || ''));
-      return m ? parseInt(m[1], 10) * 60 + parseInt(m[2], 10) : null;
-    };
-    const start = toMin(wh.start), end = toMin(wh.end);
-    return start !== null && end !== null && minutes >= start && minutes <= end;
+    const start = parseTimeToMinutes(wh.start);
+    const end = parseTimeToMinutes(wh.end);
+    return start !== null && end !== null && slotMinutes >= start && slotMinutes <= end;
   });
 }
 
@@ -99,9 +126,10 @@ function createConversation(opts) {
   }
 
   /** The initial TwiML when the phone rings. */
-  function greetingTwiml(actionUrl) {
+  function greetingTwiml(actionUrl, opts) {
+    const greeting = (opts && opts.greeting) ? opts.greeting : GREETING;
     return BotEngine.wrapTwiml(
-      BotEngine.gather(GREETING, actionUrl) +
+      BotEngine.gather(greeting, actionUrl) +
       BotEngine.say('कृपया बाद में कॉल करें।')
     );
   }
@@ -114,7 +142,13 @@ function createConversation(opts) {
 
     let session = null;
     if (callSid) session = await store.getSession(callSid);
-    if (!session) session = { call_sid: callSid, phone: from, attempt: 0 };
+    const clinic = input.clinic || (session && session.clinic) || null;
+    if (!session) {
+      session = { call_sid: callSid, phone: from, attempt: 0 };
+      if (clinic) session.clinic = clinic;
+    } else if (clinic && !session.clinic) {
+      session.clinic = clinic;
+    }
 
     const slots = BotEngine.extract({
       transcript: input.transcript || '',
@@ -129,10 +163,12 @@ function createConversation(opts) {
 
     // ---------------------------------------------------------- emergencies
     if (slots.is_emergency) {
-      const appointment = await store.createAppointment(Object.assign(slotsFromSession(session), {
+      const emergencyData = Object.assign(slotsFromSession(session), {
         phone: from, call_sid: callSid, raw_text: slots.raw_text,
         status: 'Emergency', priority: 'URGENT',
-      }));
+      });
+      if (clinic) emergencyData.clinic = clinic;
+      const appointment = await store.createAppointment(emergencyData);
       if (input.notifyClinic) await input.notifyClinic(appointment);
       return Object.assign(endCall('यह इमरजेंसी हो सकती है। कृपया तुरंत 108 पर कॉल कीजिए या नज़दीकी अस्पताल जाइए। धन्यवाद!'),
         { status: 'Emergency', appointment });
@@ -207,7 +243,7 @@ function createConversation(opts) {
     if (slots.all_collected) {
       // 0. doctor availability: working day + working hours + holidays
       if (opts.doctorProvider) {
-        const doctor = await opts.doctorProvider();
+        const doctor = await opts.doctorProvider(clinic);
         if (doctor) {
           const weekday = BotEngine.dayOfWeekFromDate(slots.date);
           const holiday = (doctor.holidays || []).includes(slots.date_iso);
@@ -249,7 +285,9 @@ function createConversation(opts) {
       }
 
       // 1. same person, same slot -> never book twice
-      const duplicate = await store.findDuplicate({ phone: from, date: slots.date, time_slot: slots.time_slot });
+      const dupQuery = { phone: from, date: slots.date, time_slot: slots.time_slot };
+      if (clinic) dupQuery.clinic = clinic;
+      const duplicate = await store.findDuplicate(dupQuery);
       if (duplicate) {
         await store.saveSession(sessionWith(slots, { call_sid: callSid, phone: from, status: 'Duplicate', completed: true }));
         return Object.assign(
@@ -259,7 +297,9 @@ function createConversation(opts) {
 
       // 2. slot cap (optional): move the caller to another time instead of overbooking
       if (maxPerSlot > 0) {
-        const booked = await store.countBooked({ date: slots.date, time_slot: slots.time_slot });
+        const countQuery = { date: slots.date, time_slot: slots.time_slot };
+        if (clinic) countQuery.clinic = clinic;
+        const booked = await store.countBooked(countQuery);
         if (booked >= maxPerSlot) {
           slots.time_slot = null;
           slots.time_slot_display = null;
@@ -290,12 +330,64 @@ function createConversation(opts) {
     }
 
     if (slots.all_collected) {
-      const appointment = await store.createAppointment(Object.assign(slots, {
+      const apptData = Object.assign(slots, {
         phone: from, call_sid: callSid, raw_text: slots.raw_text,
         status: 'Confirmed', priority: 'Normal',
         source: 'voice-bot',
-      }));
+      });
+      if (clinic) apptData.clinic = clinic;
+
+      let appointment;
+      if (clinic && typeof store.createAppointmentIfAvailable === 'function') {
+        const res = await store.createAppointmentIfAvailable(apptData, maxPerSlot);
+        if (!res.ok) {
+          if (res.reason === 'duplicate') {
+            const dup = await store.findDuplicate({ phone: from, date: slots.date, time_slot: slots.time_slot, clinic });
+            await store.saveSession(sessionWith(slots, { call_sid: callSid, phone: from, status: 'Duplicate', completed: true }));
+            return Object.assign(
+              endCall(BotEngine.HINTS.already_booked + confirmationSpeech(dup || apptData)),
+              { status: 'Duplicate', appointment: dup || apptData, duplicate: true }
+            );
+          }
+          if (res.reason === 'slot_full') {
+            slots.time_slot = null;
+            slots.time_slot_display = null;
+            slots.time_slot_speech = null;
+            slots.hint = 'slot_full';
+            slots.missing = BotEngine.computeMissing(slots);
+            slots.all_collected = false;
+            const field = BotEngine.nextField(slots.missing);
+            const question = BotEngine.HINTS[slots.hint] + BotEngine.questionFor(field, 1);
+            await store.saveSession(sessionWith(slots, {
+              call_sid: callSid, phone: from, status: 'InProgress',
+              awaiting_confirm: false, attempt: 1, asked_field: field,
+              missing_count: slots.missing.length, raw_text: slots.raw_text,
+            }));
+            return {
+              twiml: BotEngine.wrapTwiml(
+                BotEngine.gather(question, actionUrl) +
+                BotEngine.say('कृपया बाद में कॉल कीजिए।')
+              ),
+              ended: false, status: 'InProgress', asked_field: field, attempt: 1,
+            };
+          }
+        }
+        appointment = res.appointment;
+      } else {
+        appointment = await store.createAppointment(apptData);
+      }
       await store.saveSession(sessionWith(slots, { call_sid: callSid, phone: from, status: 'Confirmed', completed: true }));
+      if (clinic && appointment && (appointment._id || appointment.id) && typeof store.recordClinicUsage === 'function') {
+        try {
+          const bookingMonth = getBillingMonth(appointment.createdAt || now());
+          await store.recordClinicUsage(
+            clinic,
+            bookingMonth,
+            { booking_count: 1 },
+            { eventId: 'booking:' + String(appointment._id || appointment.id), eventType: 'booking' }
+          );
+        } catch (_) {}
+      }
       if (input.notifyClinic) await input.notifyClinic(appointment);
       return Object.assign(endCall(confirmationSpeech(appointment)),
         { status: 'Confirmed', appointment });
@@ -306,10 +398,12 @@ function createConversation(opts) {
     const nextAttempt = slots.progressed ? 1 : (session.attempt || 0) + 1;
 
     if (nextAttempt > maxAttempts) {
-      const partial = await store.createAppointment(Object.assign(slotsFromSession(session), {
+      const partialData = Object.assign(slotsFromSession(session), {
         phone: from, call_sid: callSid, raw_text: slots.raw_text + ' ' + (session.raw_text || ''),
         status: 'Incomplete', priority: 'Normal', source: 'voice-bot',
-      }));
+      });
+      if (clinic) partialData.clinic = clinic;
+      const partial = await store.createAppointment(partialData);
       await store.saveSession(sessionWith(slots, { call_sid: callSid, phone: from, status: 'Incomplete', completed: true }));
       return Object.assign(endCall('क्षमा कीजिए, मैं समझ नहीं पाई। आप थोड़ी देर बाद दोबारा कॉल कीजिए। धन्यवाद!'),
         { status: 'Incomplete', appointment: partial });
@@ -340,11 +434,12 @@ function createConversation(opts) {
   }
 
   function sessionWith(slots, extra) {
-    return Object.assign({
+    const res = Object.assign({
       name: slots.name, date: slots.date, date_iso: slots.date_iso, date_speech: slots.date_speech,
       time_slot: slots.time_slot, time_slot_display: slots.time_slot_display, time_slot_speech: slots.time_slot_speech,
       reason: slots.reason, booking_for: slots.booking_for,
     }, extra || {});
+    return res;
   }
 
   /** Twilio status callback: the caller hung up mid-conversation. */
@@ -361,10 +456,13 @@ function createConversation(opts) {
       return { saved: false, status: 'Abandoned' };
     }
 
-    const appointment = await store.createAppointment({
-      ...session, status: 'Abandoned', priority: 'Normal', source: 'voice-bot',
+    const clinic = input.clinic || session.clinic || null;
+    const apptData = Object.assign({}, session, {
+      status: 'Abandoned', priority: 'Normal', source: 'voice-bot',
       raw_text: session.raw_text || '',
     });
+    if (clinic) apptData.clinic = clinic;
+    const appointment = await store.createAppointment(apptData);
     await store.saveSession(Object.assign({}, session, { status: 'Abandoned', completed: true }));
     return { saved: true, status: 'Abandoned', appointment };
   }

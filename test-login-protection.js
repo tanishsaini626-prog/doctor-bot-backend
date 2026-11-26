@@ -13,6 +13,7 @@ const path = require('path');
 
 const { createMemoryStore } = require('./store-memory');
 const { createFileStore } = require('./store-file');
+const { createMongoStore } = require('./store-mongo');
 
 // Configuration constants (match auth.js env defaults)
 const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || '15', 10);

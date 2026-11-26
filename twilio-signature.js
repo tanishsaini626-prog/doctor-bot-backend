@@ -13,18 +13,31 @@
 
 const twilio = require('twilio');
 
-/** Rebuilds the exact URL Twilio signed (proxy-aware: ngrok, Render, Vercel). */
+/** Rebuilds the exact URL Twilio signed (proxy-aware: ngrok, Render, Vercel, multi-proxy chains). */
 function publicUrl(req) {
-  const proto = req.get('x-forwarded-proto') || req.protocol || 'https';
-  const host = req.get('x-forwarded-host') || req.get('host') || '';
+  const rawProto = req.get('x-forwarded-proto') || req.protocol || 'https';
+  // If behind multiple reverse proxies (e.g. Cloudflare -> ALB -> Node), take the first (client-facing) proto
+  const proto = String(rawProto).split(',')[0].trim() || 'https';
+  const rawHost = req.get('x-forwarded-host') || req.get('host') || '';
+  // Similarly, take the client-facing host if multiple comma-separated proxy hosts exist
+  const host = String(rawHost).split(',')[0].trim();
   return `${proto}://${host}${req.originalUrl || req.url}`;
 }
 
 /** Returns an Express middleware. Signature checked only for enabled routes. */
 function requireTwilioSignature(options) {
   const opts = options || {};
-  const enabled = () => opts.enabled !== undefined ? opts.enabled
-    : String(process.env.TWILIO_VALIDATE_SIGNATURE || '').toLowerCase() === 'true';
+  const enabled = () => {
+    // F-06: Production MUST never permit disabling signature verification
+    if (process.env.NODE_ENV === 'production') {
+      return true;
+    }
+    if (opts.enabled !== undefined) return opts.enabled;
+    const envVal = String(process.env.TWILIO_VALIDATE_SIGNATURE || '').toLowerCase();
+    if (envVal === 'true') return true;
+    if (envVal === 'false') return false;
+    return false;
+  };
   const authToken = () => opts.authToken !== undefined ? opts.authToken : process.env.TWILIO_AUTH_TOKEN;
 
   return function (req, res, next) {
@@ -38,7 +51,7 @@ function requireTwilioSignature(options) {
     if (!signature) return res.status(403).type('text/plain').send('Missing X-Twilio-Signature');
 
     const url = publicUrl(req);
-    const params = req.body || {};
+    const params = req.method === 'GET' ? {} : (req.body || {});
     const valid = twilio.validateRequest(token, signature, url, params);
     if (!valid) {
       console.warn('Rejected forged Twilio webhook for', url);
