@@ -23,10 +23,14 @@ const { createMemoryStore } = require('./store-memory');
 
 // Methods that change state and therefore must trigger a flush to disk.
 const MUTATING = new Set([
-  'saveSession', 'clearSession', 'createAppointment', 'updateAppointmentStatus', 'deleteAppointment',
+  'saveSession', 'clearSession', 'createAppointment', 'createAppointmentIfAvailable', 'updateAppointmentStatus', 'deleteAppointment',
   'createUser', 'updateUserPassword', 'logCallTurn',
-  'createDoctor', 'updateDoctor', 'deleteDoctor', 'saveClinic', 'createLead',
+  'createDoctor', 'createDoctorIfWithinLimit', 'updateDoctor', 'updateDoctorIfWithinLimit', 'deleteDoctor', 'saveClinic', 'deleteClinic', 'createLead',
   'createTokenBlocklist',
+  'checkLoginRateLimit', 'recordLoginFailure', 'resetLoginFailure',
+  'createSubscriptionPlan', 'updateSubscriptionPlan', 'updateClinicSubscription',
+  'getOrCreateClinicUsage', 'recordClinicUsage', 'reserveBookingQuota', 'releaseBookingQuota',
+  'createCheckoutSession', 'updateCheckoutSession', 'recordPaymentEvent', 'createInvoice',
 ]);
 
 function createFileStore(filePath, options = {}) {
@@ -92,6 +96,13 @@ function createFileStore(filePath, options = {}) {
   store.users = inner.users;
   store.doctors = inner.doctors;
   store.leads = inner.leads;
+  store.plans = inner.plans;
+  store.clinicUsages = inner.clinicUsages;
+  store.usageEvents = inner.usageEvents;
+  store.checkoutSessions = inner.checkoutSessions;
+  store.paymentEvents = inner.paymentEvents;
+  store.invoices = inner.invoices;
+  store.clinics = inner.clinics;
 
   return store;
 }
