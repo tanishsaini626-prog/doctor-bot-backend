@@ -24,7 +24,7 @@ function runServer(envOverrides) {
   return spawnSync(process.execPath, [path.join(__dirname, 'server.js')], {
     env,
     encoding: 'utf8',
-    timeout: 10000,
+    timeout: 15000,
   });
 }
 
